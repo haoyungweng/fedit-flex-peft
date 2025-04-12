@@ -6,7 +6,7 @@ cuda_devices=$1
 
 # Run training
 CUDA_VISIBLE_DEVICES="${cuda_devices}" python train.py \
-    --exp_name 'hetlora-1B' \
+    --exp_name 'hetero-1B' \
     --base_model 'meta-llama/Llama-3.2-1B' \
     --data_path './data/dataset1' \
     --model_dir '/home/scratch/haoyungw/genai/' \

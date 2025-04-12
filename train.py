@@ -4,6 +4,7 @@ Federated learning training script for fine-tuning language models.
 
 import os
 import random
+import copy
 from typing import List, Dict
 import fire
 import torch
@@ -16,7 +17,9 @@ from transformers import (
 from peft import (
     LoraConfig, 
     get_peft_model, 
-    prepare_model_for_kbit_training
+    prepare_model_for_kbit_training,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict
 )
 import datasets
 from fed_utils import (
@@ -73,7 +76,7 @@ def fl_finetune(
         exp_name: Experiment name
         base_model: Base model to fine-tune
         data_path: Path to training data
-        output_dir: Directory to save outputs
+        model_dir: Directory to save outputs
         client_selection_strategy: Strategy for selecting clients
         client_selection_frac: Fraction of clients to select
         num_communication_rounds: Number of communication rounds
@@ -147,6 +150,11 @@ def fl_finetune(
         torch_dtype=torch.float16,
         device_map=device_map,
     )
+    # Prepare model for training
+    base_model_obj = prepare_model_for_kbit_training(base_model_obj)
+    
+    # Save a clean copy to avoid multiple PEFT layers
+    clean_base_model_obj = copy.deepcopy(base_model_obj)
 
     # Tokenization function for data preprocessing
     def tokenize(prompt, add_eos_token=True):
@@ -200,30 +208,34 @@ def fl_finetune(
             # Randomly assign a rank from {4, 8, 16}
             client_lora_ranks[client_id] = random.choice([4, 8, 16])
         print("Using HetLoRA with client ranks:", client_lora_ranks)
-        # Use the maximum rank for the global model
-        global_lora_r = max(client_lora_ranks.values())
+        rank_distribution = {}
+        for rank in client_lora_ranks.values():
+            rank_distribution[rank] = rank_distribution.get(rank, 0) + 1
+        print("Rank distribution:", rank_distribution)
+        
+        # Global rank will be the maximum rank
+        global_rank = max(client_lora_ranks.values())
+        print(f"Global rank set to {global_rank} (max of all client ranks)")
     else:
         # Use the same rank for all clients when using FedAvg or no federation
-        global_lora_r = lora_r
+        global_rank = lora_r
         for client_id in range(num_clients):
             client_lora_ranks[client_id] = lora_r
+        print(f"Using homogeneous LoRA with rank {lora_r} for all clients")
 
-    # Initialize the global model with LoRA
-    base_model_obj = prepare_model_for_kbit_training(base_model_obj)
-    config = LoraConfig(
-        r=global_lora_r,
+    # Initialize global parameters
+    # Create a temporary model to get initial parameters
+    temp_config = LoraConfig(
+        r=global_rank,
         lora_alpha=lora_alpha,
         target_modules=lora_target_modules,
         lora_dropout=lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(base_model_obj, config)
-    
-    # Enable model parallelism if available
-    if not ddp and torch.cuda.device_count() > 1:
-        model.is_parallelizable = True
-        model.model_parallel = True
+    temp_model = get_peft_model(base_model_obj, temp_config, adapter_name="default")
+    global_params = get_peft_model_state_dict(temp_model)
+    del temp_model  # Clean up temporary model
 
     # Start federated training
     print(f"Starting {'federated' if use_federation else 'isolated'} training...")
@@ -237,6 +249,9 @@ def fl_finetune(
     for epoch in tqdm(range(num_communication_rounds), desc="Communication Rounds"):
         print(f"\nRound {epoch+1}/{num_communication_rounds}")
         
+        # Reset base model to clean copy to avoid stacked adapters
+        base_model_obj = copy.deepcopy(clean_base_model_obj)
+        
         # Select clients for this round
         selected_clients = select_clients(
             num_clients, 
@@ -244,42 +259,50 @@ def fl_finetune(
             client_selection_strategy,
             seed=epoch
         )
-        print(f"Selected clients: {selected_clients}")
 
         # Train each selected client
         for client_id in selected_clients:
-            # Create client-specific model if needed
-            if use_hetlora or not use_federation:
-                client_lora_r = client_lora_ranks[client_id]
-                print(f"Creating model for client {client_id} with rank {client_lora_r}")
+            # Get client-specific rank
+            client_rank = client_lora_ranks[client_id]
+            print(f"\nClient {client_id}: Using LoRA rank {client_rank}")
+            
+            # Create client-specific configuration with the correct rank
+            client_config = LoraConfig(
+                r=client_rank,
+                lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            
+            # Create a fresh client model using the clean base model copy
+            client_model = get_peft_model(
+                base_model_obj, 
+                client_config,
+                adapter_name="default"
+            )
+            
+            # Load weights from global parameters
+            if use_federation:
+                if use_hetlora:
+                    print(f"Client {client_id}: Loading weights from global parameters (heterogeneous)")
+                    # For HetLoRA, we need to handle different ranks
+                    client_weights = load_hetlora_weights(
+                        client_config,
+                        global_params,
+                        client_rank
+                    )
+                    # Apply the weights to the client model
+                    set_peft_model_state_dict(client_model, client_weights, "default")
+                else:
+                    print(f"Client {client_id}: Loading weights from global parameters (homogeneous)")
+                    # For homogeneous LoRA, we can directly load the weights
+                    set_peft_model_state_dict(client_model, global_params, "default")
                 
-                # Create client-specific configuration
-                client_config = LoraConfig(
-                    r=client_lora_r,
-                    lora_alpha=lora_alpha,
-                    target_modules=lora_target_modules,
-                    lora_dropout=lora_dropout,
-                    bias="none",
-                    task_type="CAUSAL_LM",
-                )
-                
-                # Create client-specific model
-                client_model = get_peft_model(base_model_obj, client_config)
-                
-                # Load weights from global model if possible
-                if use_federation and epoch > 0:
-                    try:
-                        client_model = load_hetlora_weights(client_model, model, client_lora_r)
-                        print(f"Loaded weights for client {client_id}")
-                    except Exception as e:
-                        print(f"Error loading weights for client {client_id}: {e}")
-                
-                # Initialize client with client-specific model
-                client = FederatedClient(client_id, client_model, client_data_path, model_output_dir)
-            else:
-                # Use same model for all clients (homogeneous)
-                client = FederatedClient(client_id, model, client_data_path, model_output_dir)
-
+            # Initialize client
+            client = FederatedClient(client_id, client_model, client_data_path, model_output_dir)
+            
             # Prepare client for training
             print(f"Preparing client {client_id} for training")
             client.prepare_dataset(generate_and_tokenize_prompt, local_val_set_size)
@@ -295,31 +318,26 @@ def fl_finetune(
 
             # Train client
             print(f"Training client {client_id}")
-            client.initialize_training()
             client.train()
 
-            # Finalize client training
-            print(f"Finalizing training for client {client_id}")
-            if use_hetlora or not use_federation:
-                # Update client-specific model
-                client_model, local_dataset_len_dict, previously_selected_clients, last_client_id = client.finalize_training(
-                    epoch, local_dataset_len_dict, previously_selected_clients
-                )
-            else:
-                # Update global model
-                model, local_dataset_len_dict, previously_selected_clients, last_client_id = client.finalize_training(
-                    epoch, local_dataset_len_dict, previously_selected_clients
-                )
+            # Save client model weights
+            print(f"Saving model for client {client_id}")
+            local_dataset_len_dict, previously_selected_clients, last_client_id = client.save_client_state(
+                epoch, local_dataset_len_dict, previously_selected_clients
+            )
             
             # Clean up
             del client
+            del client_model
 
         # Perform model aggregation if using federation
         if use_federation:
-            print("Aggregating client models")
+            print("\n======= Aggregating client models =======")
             if use_hetlora:
-                model = hetlora(
-                    model,
+                print("Using HetLoRA sparsity-weighted aggregation")
+                # Use HetLoRA aggregation
+                global_params = hetlora(
+                    global_params,
                     selected_clients,
                     model_output_dir,
                     local_dataset_len_dict,
@@ -327,33 +345,68 @@ def fl_finetune(
                     client_lora_ranks
                 )
             else:
-                model = fedavg(
-                    model,
+                print("Using FedAvg homogeneous aggregation")
+                # Use standard FedAvg
+                global_params = fedavg(
+                    global_params,
                     selected_clients,
                     model_output_dir,
                     local_dataset_len_dict,
                     epoch
                 )
             
-            # Save global model and configuration
+            # Save global model parameters
             round_dir = os.path.join(model_output_dir, str(epoch))
             os.makedirs(round_dir, exist_ok=True)
-            torch.save(model.state_dict(), os.path.join(round_dir, "adapter_model.bin"))
-            config.save_pretrained(model_output_dir)
+            global_params_path = os.path.join(round_dir, "global_adapter_model.bin")
+            torch.save(global_params, global_params_path)
+            print(f"Saved global parameters to {global_params_path}")
+            
+            # Save global config
+            global_config = LoraConfig(
+                r=global_rank,
+                lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            config_path = os.path.join(model_output_dir)
+            global_config.save_pretrained(config_path)
+            print(f"Saved global config with rank {global_rank} to {config_path}")
         else:
-            print("No federation: client models saved individually")
+            print("\nNo federation: client models saved individually")
 
         # Evaluate global model if validation data is provided
         if val_data_path:
             try:
+                # Create a temporary model with global parameters for evaluation
+                # Use the clean base model copy
+                eval_config = LoraConfig(
+                    r=global_rank,
+                    lora_alpha=lora_alpha,
+                    target_modules=lora_target_modules,
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                )
+                eval_model = get_peft_model(copy.deepcopy(clean_base_model_obj), eval_config)
+                
+                # Load the global parameters
+                set_peft_model_state_dict(eval_model, global_params, "default")
+                
+                # Evaluate
                 eval_loss = evaluate_global_model(
-                    model, 
+                    eval_model, 
                     val_data_path, 
                     generate_and_tokenize_prompt, 
                     batch_size=1, 
                     device='cuda' if torch.cuda.is_available() else 'cpu'
                 )
-                print(f"Round {epoch} validation loss: {eval_loss}")
+                print(f"Round {epoch + 1} validation loss: {eval_loss}")
+                
+                # Clean up
+                del eval_model
             except Exception as e:
                 print(f"Evaluation error: {e}")
 

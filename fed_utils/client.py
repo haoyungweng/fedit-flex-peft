@@ -45,8 +45,6 @@ class FederatedClient:
         self.local_val_set_size = 0
         self.train_args = None
         self.local_trainer = None
-        self.params_dict_old = None
-        self.params_dict_new = None
 
     def prepare_dataset(self, preprocessing_fn: Callable, val_set_size: int = 0):
         """
@@ -125,47 +123,22 @@ class FederatedClient:
             ),
         )
 
-    def initialize_training(self):
-        """
-        Initialize the model for local training.
-        Stores the original parameters and sets up state_dict for LoRA.
-        """
-        # Disable caching during training
-        self.model.config.use_cache = False
-        
-        # Store original parameters
-        self.params_dict_old = copy.deepcopy(
-            OrderedDict((name, param.detach()) 
-                       for name, param in self.model.named_parameters() 
-                       if "default" in name)
-        )
-        
-        # Set current parameters
-        self.params_dict_new = OrderedDict(
-            (name, param.detach()) 
-            for name, param in self.model.named_parameters() 
-            if "default" in name
-        )
-        
-        # Override state_dict to get LoRA parameters
-        self.model.state_dict = (
-            lambda instance, *_, **__: get_peft_model_state_dict(
-                instance, self.params_dict_new, "default"
-            )
-        ).__get__(self.model, type(self.model))
-
     def train(self):
         """
         Train the model on the local dataset.
         """
+        # Disable caching during training
+        self.model.config.use_cache = False
+        
+        # Train the model
         self.local_trainer.train()
 
-    def finalize_training(self, 
+    def save_client_state(self, 
                          epoch: int, 
                          dataset_len_dict: Dict[int, int], 
-                         participating_clients: Set[int]) -> Tuple[Any, Dict[int, int], Set[int], int]:
+                         participating_clients: Set[int]) -> Tuple[Dict[int, int], Set[int], int]:
         """
-        Finalize the training process by saving the model and updating metadata.
+        Save the client model state after training.
         
         Args:
             epoch: Current communication round
@@ -173,7 +146,7 @@ class FederatedClient:
             participating_clients: Set of client IDs that have participated
             
         Returns:
-            Tuple of (model, updated dataset_len_dict, updated participating_clients, client_id)
+            Tuple of (updated dataset_len_dict, updated participating_clients, client_id)
         """
         # Store dataset length
         dataset_len_dict[self.client_id] = len(self.local_train_dataset)
@@ -182,19 +155,15 @@ class FederatedClient:
         client_dir = os.path.join(self.output_dir, str(epoch), f"client_{self.client_id}")
         os.makedirs(client_dir, exist_ok=True)
         
-        # Save new adapter weights
-        new_adapter_weight = self.model.state_dict()
-        torch.save(new_adapter_weight, os.path.join(client_dir, "adapter_model.bin"))
+        # Save adapter weights
+        adapter_weights = get_peft_model_state_dict(self.model)
+        torch.save(adapter_weights, os.path.join(client_dir, "adapter_model.bin"))
         
         # Save client-specific config
         if hasattr(self.model, 'peft_config') and 'default' in self.model.peft_config:
             self.model.peft_config['default'].save_pretrained(client_dir)
         
-        # Restore original weights
-        older_adapter_weight = get_peft_model_state_dict(self.model, self.params_dict_old, "default")
-        set_peft_model_state_dict(self.model, older_adapter_weight, "default")
-        
         # Update metadata
         participating_clients = participating_clients | {self.client_id}
 
-        return self.model, dataset_len_dict, participating_clients, self.client_id
+        return dataset_len_dict, participating_clients, self.client_id
