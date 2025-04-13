@@ -6,7 +6,7 @@ cuda_devices=$1
 
 # Run generation
 CUDA_VISIBLE_DEVICES="${cuda_devices}" python generate.py \
-    --exp_name 'fedavg-1B' \
+    --exp_name 'homo-1B' \
     --base_model 'meta-llama/Llama-3.2-1B' \
     --model_dir '/home/scratch/haoyungw/genai/' \
     --communication_rounds 20 \

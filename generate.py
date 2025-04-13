@@ -133,20 +133,20 @@ def generate(
     # Load LoRA weights based on whether using global or client model
     if is_global_model:
         # Load global model
-        config_path = os.path.join(experiment_model_dir, "global_adapter_config.json")
+        config_path = os.path.join(experiment_model_dir)
         weights_path = os.path.join(experiment_model_dir, str(round_idx), "global_adapter_model.bin")
         print(f"Loading global model weights from {weights_path}")
         print(f"Using global config from {config_path}")
     else:
         # Load client-specific model
         client_model_dir = os.path.join(experiment_model_dir, str(round_idx), f"client_{client_id}")
-        config_path = os.path.join(client_model_dir, "adapter_config.json")
+        config_path = os.path.join(client_model_dir)
         weights_path = os.path.join(client_model_dir, "adapter_model.bin")
         print(f"Loading client {client_id} weights from {weights_path}")
         print(f"Using client config from {config_path}")
     
     # Verify paths exist
-    if not os.path.exists(config_path):
+    if not os.path.exists(os.path.join(config_path, "adapter_config.json")):
         raise FileNotFoundError(f"Config file not found at {config_path}. Make sure the path is correct.")
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Model weights not found at {weights_path}. Make sure the path is correct.")
