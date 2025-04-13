@@ -148,7 +148,6 @@ def hetlora(
         model_path = os.path.join(output_dir, str(epoch), f"client_{client_id}", "adapter_model.bin")
         client_state_dict = torch.load(model_path)
         client_weights[client_id] = client_state_dict
-        print(client_state_dict.keys())
         
         # Compute sparsity score (Frobenius norm of the LoRA update)
         total_norm_squared = 0.0

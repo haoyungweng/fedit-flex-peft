@@ -133,7 +133,7 @@ def generate(
     # Load LoRA weights based on whether using global or client model
     if is_global_model:
         # Load global model
-        config_path = os.path.join(experiment_model_dir)
+        config_path = os.path.join(experiment_model_dir, str(round_idx))
         weights_path = os.path.join(experiment_model_dir, str(round_idx), "global_adapter_model.bin")
         print(f"Loading global model weights from {weights_path}")
         print(f"Using global config from {config_path}")

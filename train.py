@@ -203,10 +203,20 @@ def fl_finetune(
     # Prepare client LoRA ranks for HetLoRA
     client_lora_ranks = {}
     if use_hetlora:
+        ranks = [4, 8, 16]
+        num_rank_categories = len(ranks)
+        base_count = num_clients // num_rank_categories
+        remainder = num_clients % num_rank_categories
+
+        counts = [base_count + 1 if i < remainder else base_count
+                for i in range(num_rank_categories)]
+        rank_assignments = [rank for i, rank in enumerate(ranks)
+                             for _ in range(counts[i])]
+        
         random.seed(309)  # For reproducibility
-        for client_id in range(num_clients):
-            # Randomly assign a rank from {4, 8, 16}
-            client_lora_ranks[client_id] = random.choice([4, 8, 16])
+        random.shuffle(rank_assignments)
+        
+        client_lora_ranks = dict(enumerate(rank_assignments))
         print("Using HetLoRA with client ranks:", client_lora_ranks)
         rank_distribution = {}
         for rank in client_lora_ranks.values():
@@ -371,7 +381,7 @@ def fl_finetune(
                 bias="none",
                 task_type="CAUSAL_LM",
             )
-            config_path = os.path.join(model_output_dir)
+            config_path = os.path.join(round_dir)
             global_config.save_pretrained(config_path)
             print(f"Saved global config with rank {global_rank} to {config_path}")
         else:
