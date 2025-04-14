@@ -44,7 +44,7 @@ def fedavg(
     # Weighted aggregation of client models
     for k, client_id in enumerate(selected_clients):
         model_path = os.path.join(output_dir, str(epoch), f"client_{client_id}", "adapter_model.bin")
-        client_weights = torch.load(model_path)
+        client_weights = torch.load(model_path, map_location="cpu")
         
         if k == 0:
             # Initialize weighted sum with first client's weights
@@ -88,21 +88,30 @@ def load_hetlora_weights(
         print(f"load_hetlora: No global parameters with LoRA structure found")
         return client_weights
     
-    # Copy weights with truncation where necessary
-    print(f"load_hetlora: Truncating global parameters to client rank {client_rank}")
-    for key, global_param in global_params.items():
+    # Group parameters by module for more efficient processing
+    module_names = set()
+    for key in global_params.keys():
         if "lora_A." in key:
+            module_name = key.split('.lora_A.')[0]
+            module_names.add(module_name)
+    
+    # Process each module's A and B matrices together
+    for module_name in module_names:
+        a_key = f"{module_name}.lora_A.weight"
+        b_key = f"{module_name}.lora_B.weight"
+        
+        if a_key in global_params and b_key in global_params:
             # For lora_A matrices: [rank, in_features]
             if client_rank <= global_rank:
-                client_weights[key] = global_param[:client_rank, :].clone()
-                print(f"  Truncated {key}: from {global_param.shape} to {client_weights[key].shape}")
-        elif "lora_B." in key:
+                client_weights[a_key] = global_params[a_key][:client_rank, :].clone()
+            
             # For lora_B matrices: [out_features, rank]
             if client_rank <= global_rank:
-                client_weights[key] = global_param[:, :client_rank].clone()
-                print(f"  Truncated {key}: from {global_param.shape} to {client_weights[key].shape}")
-        else:
-            # For other adapter parameters (like scaling)
+                client_weights[b_key] = global_params[b_key][:, :client_rank].clone()
+    
+    # Process other parameters
+    for key, global_param in global_params.items():
+        if ".lora_A." not in key and ".lora_B." not in key:
             client_weights[key] = global_param.clone()
     
     print(f"load_hetlora: Truncation complete with {len(client_weights)} parameters")
@@ -146,29 +155,50 @@ def hetlora(
     for client_id in selected_clients:
         client_rank = client_lora_ranks[client_id]
         model_path = os.path.join(output_dir, str(epoch), f"client_{client_id}", "adapter_model.bin")
-        client_state_dict = torch.load(model_path)
+        client_state_dict = torch.load(model_path, map_location="cpu")
         client_weights[client_id] = client_state_dict
         
-        # Compute sparsity score (Frobenius norm of the LoRA update)
+        # Optimized Frobenius norm calculation using trace trick
         total_norm_squared = 0.0
         processed_modules = set()
         
-        for key_a in client_state_dict.keys():
-            if "lora_A." in key_a:
-                # Find corresponding B matrix
-                key_b = key_a.replace("lora_A", "lora_B")
-                module_name = key_a.split('.lora_A.')[0]
+        # Group parameters by module for more efficient processing
+        module_to_keys = {}
+        for key in client_state_dict.keys():
+            if ".lora_A." in key:
+                module_name = key.split('.lora_A.')[0]
+                if module_name not in module_to_keys:
+                    module_to_keys[module_name] = {"A": None, "B": None}
+                module_to_keys[module_name]["A"] = key
+            elif ".lora_B." in key:
+                module_name = key.split('.lora_B.')[0]
+                if module_name not in module_to_keys:
+                    module_to_keys[module_name] = {"A": None, "B": None}
+                module_to_keys[module_name]["B"] = key
+        
+        # Process each module more efficiently
+        for module_name, keys in module_to_keys.items():
+            if keys["A"] is not None and keys["B"] is not None:
+                lora_A = client_state_dict[keys["A"]]  # [r, in_dim]
+                lora_B = client_state_dict[keys["B"]]  # [out_dim, r]
                 
-                # Process each module only once
-                if module_name not in processed_modules and key_b in client_state_dict:
-                    lora_A = client_state_dict[key_a]  # [r, in_dim]
-                    lora_B = client_state_dict[key_b]  # [out_dim, r]
+                # Verify shapes match the expected client rank
+                if lora_A.shape[0] == client_rank and lora_B.shape[1] == client_rank:
+                    # Optimized computation of ||B × A||_F^2 using trace trick
+                    # ||BA||_F^2 = Tr((BA)^T(BA)) = Tr(A^TB^TBA)
+                    # This avoids materializing the full delta_W matrix
                     
-                    # Compute ΔW = B × A and its squared Frobenius norm
-                    if lora_A.shape[0] == client_rank and lora_B.shape[1] == client_rank:
-                        delta_W = lora_B @ lora_A  # [out_dim, in_dim]
-                        total_norm_squared += torch.sum(delta_W**2).item()
-                        processed_modules.add(module_name)
+                    # Method 1: Using matrix trace trick (more memory efficient)
+                    BTB = torch.matmul(lora_B.T, lora_B)  # [r, r]
+                    BTB_A = torch.matmul(BTB, lora_A)  # [r, in_dim]
+                    module_norm_squared = torch.sum(lora_A * BTB_A).item()
+                    
+                    # Alternative method (less memory efficient but sometimes faster):
+                    # delta_W = torch.matmul(lora_B, lora_A)  # [out_dim, in_dim]
+                    # module_norm_squared = torch.sum(delta_W**2).item()
+                    
+                    total_norm_squared += module_norm_squared
+                    processed_modules.add(module_name)
         
         # Calculate the Frobenius norm as the sparsity score
         client_sparsity_scores[client_id] = total_norm_squared ** 0.5
@@ -195,14 +225,14 @@ def hetlora(
             if "lora_A." in key:
                 # For A matrices: [max_rank, in_dim]
                 in_dim = param.shape[1]
-                global_params[key] = torch.zeros((max_rank, in_dim))
+                global_params[key] = torch.zeros((max_rank, in_dim), device="cpu")
             elif "lora_B." in key:
                 # For B matrices: [out_dim, max_rank]
                 out_dim = param.shape[0]
-                global_params[key] = torch.zeros((out_dim, max_rank))
+                global_params[key] = torch.zeros((out_dim, max_rank), device="cpu")
             else:
                 # For other parameters, copy directly
-                global_params[key] = torch.zeros_like(param)
+                global_params[key] = torch.zeros_like(param, device="cpu")
     
     # Ensure global params have right shape for current max_rank
     if any("lora_A." in key for key in global_params.keys()):
@@ -219,7 +249,7 @@ def hetlora(
                 if "lora_A." in key:
                     # For A matrices: [current_rank, in_dim] -> [max_rank, in_dim]
                     in_dim = param.shape[1]
-                    new_param = torch.zeros((max_rank, in_dim))
+                    new_param = torch.zeros((max_rank, in_dim), device="cpu")
                     # Copy existing weights
                     min_rank = min(current_rank, max_rank)
                     new_param[:min_rank, :] = param[:min_rank, :]
@@ -227,7 +257,7 @@ def hetlora(
                 elif "lora_B." in key:
                     # For B matrices: [out_dim, current_rank] -> [out_dim, max_rank]
                     out_dim = param.shape[0]
-                    new_param = torch.zeros((out_dim, max_rank))
+                    new_param = torch.zeros((out_dim, max_rank), device="cpu")
                     # Copy existing weights
                     min_rank = min(current_rank, max_rank)
                     new_param[:, :min_rank] = param[:, :min_rank]
@@ -240,7 +270,7 @@ def hetlora(
     # Initialize aggregated weights with zeros
     aggregated_params = {}
     for key, param in global_params.items():
-        aggregated_params[key] = torch.zeros_like(param)
+        aggregated_params[key] = torch.zeros_like(param, device="cpu")
     
     print(f"HetLoRA: Aggregating client weights with zero-padding...")
     # Aggregate client weights with sparsity-based weighting
@@ -249,15 +279,27 @@ def hetlora(
         client_state_dict = client_weights[client_id]
         weight = client_weights_array[client_id]
         
+        # Group parameters by module for more efficient processing
+        module_names = set()
+        for key in client_state_dict.keys():
+            if "lora_A." in key:
+                module_name = key.split('.lora_A.')[0]
+                module_names.add(module_name)
+        
+        # Process each module's parameters together
+        for module_name in module_names:
+            a_key = f"{module_name}.lora_A.weight"
+            b_key = f"{module_name}.lora_B.weight"
+            
+            if a_key in client_state_dict and b_key in client_state_dict and a_key in aggregated_params and b_key in aggregated_params:
+                # Zero-padding: place client weights in first client_rank rows/columns
+                aggregated_params[a_key][:client_rank, :] += client_state_dict[a_key] * weight
+                aggregated_params[b_key][:, :client_rank] += client_state_dict[b_key] * weight
+        
+        # Process other parameters
         for key, param in client_state_dict.items():
-            if key in aggregated_params:
-                if "lora_A." in key:
-                    # Zero-padding: place client weights in first client_rank rows
-                    aggregated_params[key][:client_rank, :] += param * weight
-                elif "lora_B." in key:
-                    # Zero-padding: place client weights in first client_rank columns
-                    aggregated_params[key][:, :client_rank] += param * weight
-                elif "." in key and aggregated_params[key].shape == param.shape:
+            if ".lora_A." not in key and ".lora_B." not in key:
+                if key in aggregated_params and aggregated_params[key].shape == param.shape:
                     aggregated_params[key] += param * weight
     
     print(f"HetLoRA: Aggregation complete")

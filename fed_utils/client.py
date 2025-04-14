@@ -102,12 +102,11 @@ class FederatedClient:
             logging_steps=1,
             optim="adamw_torch",
             eval_strategy="steps" if self.local_val_set_size > 0 else "no",
-            save_strategy="steps",
+            save_strategy="no",
             eval_steps=200 if self.local_val_set_size > 0 else None,
-            save_steps=200,
             output_dir=self.trainer_checkpoint_dir,
-            save_total_limit=1,
-            load_best_model_at_end=self.local_val_set_size > 0,
+            save_total_limit=1,  # Keep this just in case internal checkpoints are created
+            load_best_model_at_end=self.local_val_set_size > 0,  # Load best model if doing evaluation
             ddp_find_unused_parameters=False if use_ddp else None,
             group_by_length=group_by_length,
             dataloader_drop_last=False

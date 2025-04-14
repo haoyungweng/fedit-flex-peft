@@ -4,7 +4,6 @@ Federated learning training script for fine-tuning language models.
 
 import os
 import random
-import copy
 from typing import List, Dict
 import fire
 import torch
@@ -152,9 +151,6 @@ def fl_finetune(
     )
     # Prepare model for training
     base_model_obj = prepare_model_for_kbit_training(base_model_obj)
-    
-    # Save a clean copy to avoid multiple PEFT layers
-    clean_base_model_obj = copy.deepcopy(base_model_obj)
 
     # Tokenization function for data preprocessing
     def tokenize(prompt, add_eos_token=True):
@@ -212,6 +208,7 @@ def fl_finetune(
                 for i in range(num_rank_categories)]
         rank_assignments = [rank for i, rank in enumerate(ranks)
                              for _ in range(counts[i])]
+        # rank_assignments = [4, 8, 8, 8, 8, 8, 8, 8]
         
         random.seed(309)  # For reproducibility
         random.shuffle(rank_assignments)
@@ -234,8 +231,8 @@ def fl_finetune(
         print(f"Using homogeneous LoRA with rank {lora_r} for all clients")
 
     # Initialize global parameters
-    # Create a temporary model to get initial parameters
-    temp_config = LoraConfig(
+    # Create a global config for reference
+    global_config = LoraConfig(
         r=global_rank,
         lora_alpha=lora_alpha,
         target_modules=lora_target_modules,
@@ -243,9 +240,15 @@ def fl_finetune(
         bias="none",
         task_type="CAUSAL_LM",
     )
-    temp_model = get_peft_model(base_model_obj, temp_config, adapter_name="default")
-    global_params = get_peft_model_state_dict(temp_model)
-    del temp_model  # Clean up temporary model
+    
+    # Initialize global model and get initial parameters
+    global_model = get_peft_model(base_model_obj, global_config)
+    global_params = get_peft_model_state_dict(global_model)
+    
+    # Now remove the adapter from the base model
+    base_model_obj = global_model.get_base_model()
+    print(type(global_model), type(base_model_obj))
+    del global_model  # Free up memory
 
     # Start federated training
     print(f"Starting {'federated' if use_federation else 'isolated'} training...")
@@ -258,9 +261,6 @@ def fl_finetune(
     # Main training loop
     for epoch in tqdm(range(num_communication_rounds), desc="Communication Rounds"):
         print(f"\nRound {epoch+1}/{num_communication_rounds}")
-        
-        # Reset base model to clean copy to avoid stacked adapters
-        base_model_obj = copy.deepcopy(clean_base_model_obj)
         
         # Select clients for this round
         selected_clients = select_clients(
@@ -286,7 +286,12 @@ def fl_finetune(
                 task_type="CAUSAL_LM",
             )
             
-            # Create a fresh client model using the clean base model copy
+            # Create a fresh client model
+            # Ensure base_model_obj has no PEFT adapters
+            if hasattr(base_model_obj, "get_base_model"):
+                print('\n\n\nGET BASE MODEL\n\n\n')
+                base_model_obj = base_model_obj.get_base_model()
+                
             client_model = get_peft_model(
                 base_model_obj, 
                 client_config,
@@ -335,6 +340,9 @@ def fl_finetune(
             local_dataset_len_dict, previously_selected_clients, last_client_id = client.save_client_state(
                 epoch, local_dataset_len_dict, previously_selected_clients
             )
+            
+            # Get the base model back
+            base_model_obj = client_model.get_base_model()
             
             # Clean up
             del client
@@ -390,8 +398,12 @@ def fl_finetune(
         # Evaluate global model if validation data is provided
         if val_data_path:
             try:
+                print("\nEvaluating global model on validation data...")
+                # Ensure base_model_obj has no PEFT adapters
+                if hasattr(base_model_obj, "get_base_model"):
+                    base_model_obj = base_model_obj.get_base_model()
+                
                 # Create a temporary model with global parameters for evaluation
-                # Use the clean base model copy
                 eval_config = LoraConfig(
                     r=global_rank,
                     lora_alpha=lora_alpha,
@@ -400,7 +412,7 @@ def fl_finetune(
                     bias="none",
                     task_type="CAUSAL_LM",
                 )
-                eval_model = get_peft_model(copy.deepcopy(clean_base_model_obj), eval_config)
+                eval_model = get_peft_model(base_model_obj, eval_config)
                 
                 # Load the global parameters
                 set_peft_model_state_dict(eval_model, global_params, "default")
@@ -414,6 +426,9 @@ def fl_finetune(
                     device='cuda' if torch.cuda.is_available() else 'cpu'
                 )
                 print(f"Round {epoch + 1} validation loss: {eval_loss}")
+                
+                # Get base model back
+                base_model_obj = eval_model.get_base_model()
                 
                 # Clean up
                 del eval_model
