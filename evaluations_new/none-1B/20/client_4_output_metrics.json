@@ -1,0 +1,32 @@
+{
+  "paraphrase": {
+    "accuracy": 0.54
+  },
+  "entailment": {
+    "accuracy": 0.345
+  },
+  "text_formatting": {
+    "rouge1": 0.7022046526883794,
+    "rouge2": 0.6567890220633505,
+    "rougeL": 0.6992306683873556,
+    "rougeLsum": 0.6966688146878159
+  },
+  "structure_to_text": {
+    "rouge1": 0.3673555942716653,
+    "rouge2": 0.18136459860826054,
+    "rougeL": 0.2931657451687878,
+    "rougeLsum": 0.30073386666007285
+  },
+  "linguistic_acceptability": {
+    "accuracy": 0.645
+  },
+  "word_disambiguation": {
+    "accuracy": 0.455
+  },
+  "coreference": {
+    "accuracy": 0.54
+  },
+  "question_classification": {
+    "accuracy": 0.39
+  }
+}
