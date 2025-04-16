@@ -10,6 +10,17 @@ import fire
 import evaluate
 from tqdm import tqdm
 
+TASK_METRICS = {
+    "entailment": "accuracy",           # Classification task
+    "paraphrase": "accuracy",           # Classification task
+    "text_formatting": "rouge",         # Generation task
+    "structure_to_text": "rouge",       # Generation task
+    "linguistic_acceptability": "accuracy", # Classification task
+    "word_disambiguation": "accuracy",  # Classification task
+    "coreference": "accuracy",          # Classification task
+    "question_classification": "accuracy" # Classification task
+}
+
 
 def load_data(file_path: str, key: str) -> Dict[str, List[Dict]]:
     """
@@ -65,7 +76,43 @@ def compute_rouge_scores(targets: List[str], predictions: List[str]) -> Dict:
     results = rouge.compute(predictions=predictions, references=targets)
     return results
 
-
+def compute_scores(targets: List[str], predictions: List[str], metric_type: str) -> Dict:
+    """
+    Compute scores between target and prediction texts based on the appropriate metric.
+    
+    Args:
+        targets: List of reference texts
+        predictions: List of generated texts
+        metric_type: Type of metric to use ('rouge', 'accuracy', etc.)
+        
+    Returns:
+        Dictionary of metric results
+    """
+    if metric_type == 'rouge':
+        # For summarization and generation tasks
+        rouge = evaluate.load("rouge")
+        results = rouge.compute(predictions=predictions, references=targets)
+        return results
+    
+    elif metric_type == 'accuracy':
+        # For classification tasks
+        # Normalize text to account for whitespace/case differences
+        clean_preds = [p.strip().lower() for p in predictions]
+        clean_targets = [t.strip().lower() for t in targets]
+        
+        # Calculate accuracy manually
+        correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
+        accuracy = correct / len(targets) if len(targets) > 0 else 0
+        
+        return {"accuracy": accuracy}
+    
+    else:
+        # Default to ROUGE if unknown metric type
+        print(f"Warning: Unknown metric type '{metric_type}', using ROUGE")
+        rouge = evaluate.load("rouge")
+        results = rouge.compute(predictions=predictions, references=targets)
+        return results
+    
 def evaluate_results(
     targets: Dict[str, List[Dict]], 
     predictions: Dict[str, List[Dict]],
@@ -80,8 +127,8 @@ def evaluate_results(
         output_path: Path to save evaluation results
     """
     results = {}
-    all_targets = []
-    all_predictions = []
+    # all_targets = []
+    # all_predictions = []
     
     # Evaluate each category
     for category in targets.keys():
@@ -109,21 +156,25 @@ def evaluate_results(
             target_outputs.append(target['output'])
             prediction_outputs.append(prediction['output'])
         
+        # Get the appropriate metric for this category
+        metric_type = TASK_METRICS.get(category, "rouge")  # Default to rouge if category not found
+        
         # Compute scores for this category
-        category_results = compute_rouge_scores(target_outputs, prediction_outputs)
+        category_results = compute_scores(target_outputs, prediction_outputs, metric_type)
         results[category] = category_results
         
         # Add to overall evaluation lists
-        all_targets.extend(target_outputs)
-        all_predictions.extend(prediction_outputs)
+        # all_targets.extend(target_outputs)
+        # all_predictions.extend(prediction_outputs)
     
     # Compute overall scores
-    results['total'] = compute_rouge_scores(all_targets, all_predictions)
+    # results['total'] = compute_rouge_scores(all_targets, all_predictions)
     
     # Print results
     print("\nEvaluation Results:")
     for category, scores in results.items():
-        print(f"{category}:")
+        metric_used = TASK_METRICS.get(category, "rouge")
+        print(f"{category} (evaluated with {metric_used}):")
         for metric, value in scores.items():
             print(f"  {metric}: {value:.4f}")
     
@@ -184,7 +235,7 @@ def main(
         evaluation_dir, 
         exp_name, 
         str(communication_rounds), 
-        f"{prediction_filename.replace('.jsonl', '_rouge.json')}"
+        f"{prediction_filename.replace('.jsonl', '_metrics.json')}"
     )
     
     # Evaluate and save results
