@@ -1,6 +1,6 @@
 """
 Evaluation script for federated learning models.
-Computes ROUGE scores for model-generated outputs compared to reference outputs.
+Computes appropriate metrics for model-generated outputs compared to reference outputs.
 """
 
 from typing import Dict, List
@@ -9,16 +9,18 @@ import json
 import fire
 import evaluate
 from tqdm import tqdm
+from sklearn.metrics import f1_score, matthews_corrcoef
 
+# Updated metrics for each task type
 TASK_METRICS = {
-    "entailment": "accuracy",           # Classification task
-    "paraphrase": "accuracy",           # Classification task
-    "text_formatting": "rouge",         # Generation task
-    "structure_to_text": "rouge",       # Generation task
-    "linguistic_acceptability": "accuracy", # Classification task
-    "word_disambiguation": "accuracy",  # Classification task
-    "coreference": "accuracy",          # Classification task
-    "question_classification": "accuracy" # Classification task
+    "entailment": "accuracy",              # Classification task
+    "paraphrase": "f1",                    # Classification task - F1 is better for potential imbalance
+    "text_formatting": "rouge",            # Generation task
+    "structure_to_text": "rouge",          # Generation task
+    "linguistic_acceptability": "mcc",     # Classification task - MCC handles imbalance better
+    "word_disambiguation": "f1",           # Classification task - F1 for potential class imbalance
+    "coreference": "f1",                   # Classification task - F1 better for coreference
+    "question_classification": "accuracy"  # Classification task
 }
 
 
@@ -76,6 +78,7 @@ def compute_rouge_scores(targets: List[str], predictions: List[str]) -> Dict:
     results = rouge.compute(predictions=predictions, references=targets)
     return results
 
+
 def compute_scores(targets: List[str], predictions: List[str], metric_type: str) -> Dict:
     """
     Compute scores between target and prediction texts based on the appropriate metric.
@@ -83,36 +86,88 @@ def compute_scores(targets: List[str], predictions: List[str], metric_type: str)
     Args:
         targets: List of reference texts
         predictions: List of generated texts
-        metric_type: Type of metric to use ('rouge', 'accuracy', etc.)
+        metric_type: Type of metric to use ('rouge', 'accuracy', 'f1', 'mcc', etc.)
         
     Returns:
         Dictionary of metric results
     """
+    # Normalize text to account for whitespace/case differences
+    clean_preds = [p.strip().lower() for p in predictions]
+    clean_targets = [t.strip().lower() for t in targets]
+    
     if metric_type == 'rouge':
-        # For summarization and generation tasks
+        # For text generation tasks (structure-to-text, text_formatting)
         rouge = evaluate.load("rouge")
         results = rouge.compute(predictions=predictions, references=targets)
-        return results
+        
+        # Include the most relevant ROUGE metrics for these tasks
+        return {
+            "rouge1": results["rouge1"],
+            "rouge2": results["rouge2"],
+            "rougeL": results["rougeL"],
+            "rougeLsum": results["rougeLsum"]
+        }
     
     elif metric_type == 'accuracy':
-        # For classification tasks
-        # Normalize text to account for whitespace/case differences
-        clean_preds = [p.strip().lower() for p in predictions]
-        clean_targets = [t.strip().lower() for t in targets]
-        
-        # Calculate accuracy manually
+        # For classification tasks with balanced classes (entailment, question_classification)
         correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
         accuracy = correct / len(targets) if len(targets) > 0 else 0
         
         return {"accuracy": accuracy}
     
+    elif metric_type == 'f1':
+        # For classification tasks where F1 is more appropriate (paraphrase, word_disambiguation, coreference)
+        # This is a simplified binary F1 calculation - for multi-class, would need to extend
+        correct = [p == t for p, t in zip(clean_preds, clean_targets)]
+        
+        # Get unique classes
+        all_classes = list(set(clean_targets + clean_preds))
+        
+        if len(all_classes) == 2:  # Binary classification
+            # Convert to 0/1 for binary F1
+            binary_targets = [1 if t == all_classes[0] else 0 for t in clean_targets]
+            binary_preds = [1 if p == all_classes[0] else 0 for p in clean_preds]
+            f1 = f1_score(binary_targets, binary_preds)
+            return {"f1_score": f1, "accuracy": sum(correct) / len(correct)}
+        else:  # Multi-class 
+            # One-hot encode for multi-class F1
+            from sklearn.preprocessing import LabelBinarizer
+            lb = LabelBinarizer()
+            lb.fit(all_classes)
+            targets_onehot = lb.transform(clean_targets)
+            preds_onehot = lb.transform(clean_preds)
+            
+            f1_macro = f1_score(targets_onehot, preds_onehot, average='macro')
+            f1_weighted = f1_score(targets_onehot, preds_onehot, average='weighted')
+            return {
+                "f1_macro": f1_macro,
+                "f1_weighted": f1_weighted,
+                "accuracy": sum(correct) / len(correct)
+            }
+    
+    elif metric_type == 'mcc':
+        # For linguistic_acceptability where Matthews Correlation Coefficient works well with imbalance
+        # Convert text classes to numerical if needed
+        unique_classes = sorted(list(set(clean_targets + clean_preds)))
+        class_to_idx = {c: i for i, c in enumerate(unique_classes)}
+        
+        target_indices = [class_to_idx[t] for t in clean_targets]
+        pred_indices = [class_to_idx[p] for p in clean_preds]
+        
+        mcc = matthews_corrcoef(target_indices, pred_indices)
+        
+        # Also include accuracy for comparison
+        correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
+        accuracy = correct / len(targets) if len(targets) > 0 else 0
+        
+        return {"mcc": mcc, "accuracy": accuracy}
+    
     else:
         # Default to ROUGE if unknown metric type
         print(f"Warning: Unknown metric type '{metric_type}', using ROUGE")
-        rouge = evaluate.load("rouge")
-        results = rouge.compute(predictions=predictions, references=targets)
-        return results
-    
+        return compute_rouge_scores(targets, predictions)
+
+
 def evaluate_results(
     targets: Dict[str, List[Dict]], 
     predictions: Dict[str, List[Dict]],
@@ -127,8 +182,12 @@ def evaluate_results(
         output_path: Path to save evaluation results
     """
     results = {}
-    # all_targets = []
-    # all_predictions = []
+    overall_results = {}
+    
+    # Track metrics for calculating overall scores
+    all_correct = 0
+    all_total = 0
+    all_metrics = {}
     
     # Evaluate each category
     for category in targets.keys():
@@ -163,20 +222,44 @@ def evaluate_results(
         category_results = compute_scores(target_outputs, prediction_outputs, metric_type)
         results[category] = category_results
         
-        # Add to overall evaluation lists
-        # all_targets.extend(target_outputs)
-        # all_predictions.extend(prediction_outputs)
+        # Track results for overall calculation
+        if "accuracy" in category_results:
+            # For classification tasks
+            category_correct = category_results["accuracy"] * len(target_outputs)
+            all_correct += category_correct
+            all_total += len(target_outputs)
+            
+        # Track metrics by type for overall averages
+        for metric_name, value in category_results.items():
+            if metric_name not in all_metrics:
+                all_metrics[metric_name] = {"total": 0, "count": 0}
+            all_metrics[metric_name]["total"] += value
+            all_metrics[metric_name]["count"] += 1
     
-    # Compute overall scores
-    # results['total'] = compute_rouge_scores(all_targets, all_predictions)
+    # Calculate overall metrics
+    if all_total > 0:
+        overall_results["overall_accuracy"] = all_correct / all_total
+        
+    # Calculate average for each metric type
+    for metric_name, data in all_metrics.items():
+        if data["count"] > 0:
+            overall_results[f"avg_{metric_name}"] = data["total"] / data["count"]
+    
+    # Add overall results
+    results["overall"] = overall_results
     
     # Print results
     print("\nEvaluation Results:")
     for category, scores in results.items():
-        metric_used = TASK_METRICS.get(category, "rouge")
-        print(f"{category} (evaluated with {metric_used}):")
-        for metric, value in scores.items():
-            print(f"  {metric}: {value:.4f}")
+        if category != "overall":
+            metric_used = TASK_METRICS.get(category, "rouge")
+            print(f"{category} (evaluated with {metric_used}):")
+            for metric, value in scores.items():
+                print(f"  {metric}: {value:.4f}")
+    
+    print("\nOverall Results:")
+    for metric, value in results["overall"].items():
+        print(f"  {metric}: {value:.4f}")
     
     # Save results to file
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
