@@ -19,7 +19,7 @@ TASK_METRICS = {
     "structure_to_text": "rouge",          # Generation task
     "linguistic_acceptability": "mcc",     # Classification task - MCC handles imbalance better
     "word_disambiguation": "f1",           # Classification task - F1 for potential class imbalance
-    "coreference": "f1",                   # Classification task - F1 better for coreference
+    "coreference": "accuracy",             # Classification task
     "question_classification": "accuracy"  # Classification task
 }
 
@@ -116,48 +116,86 @@ def compute_scores(targets: List[str], predictions: List[str], metric_type: str)
         return {"accuracy": accuracy}
     
     elif metric_type == 'f1':
-        # For classification tasks where F1 is more appropriate (paraphrase, word_disambiguation, coreference)
-        # This is a simplified binary F1 calculation - for multi-class, would need to extend
-        correct = [p == t for p, t in zip(clean_preds, clean_targets)]
+        # First, identify the valid options from the target outputs
+        unique_targets = sorted(list(set(clean_targets)))
         
-        # Get unique classes
-        all_classes = list(set(clean_targets + clean_preds))
+        # Verify that we have a binary classification task
+        if len(unique_targets) != 2:
+            print(f"Warning: Expected binary classification (2 classes), but found {len(unique_targets)} classes in targets.")
+            # Fall back to accuracy if it's not binary classification
+            correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
+            accuracy = correct / len(targets) if len(targets) > 0 else 0
+            return {"accuracy": accuracy}
         
-        if len(all_classes) == 2:  # Binary classification
-            # Convert to 0/1 for binary F1
-            binary_targets = [1 if t == all_classes[0] else 0 for t in clean_targets]
-            binary_preds = [1 if p == all_classes[0] else 0 for p in clean_preds]
-            f1 = f1_score(binary_targets, binary_preds)
-            return {"f1_score": f1, "accuracy": sum(correct) / len(correct)}
-        else:  # Multi-class 
-            # One-hot encode for multi-class F1
-            from sklearn.preprocessing import LabelBinarizer
-            lb = LabelBinarizer()
-            lb.fit(all_classes)
-            targets_onehot = lb.transform(clean_targets)
-            preds_onehot = lb.transform(clean_preds)
-            
-            f1_macro = f1_score(targets_onehot, preds_onehot, average='macro')
-            f1_weighted = f1_score(targets_onehot, preds_onehot, average='weighted')
-            return {
-                "f1_macro": f1_macro,
-                "f1_weighted": f1_weighted,
-                "accuracy": sum(correct) / len(correct)
-            }
+        # Valid options are the two unique values from the target outputs
+        valid_options = unique_targets
+        
+        # Process predictions - if a prediction is not in valid options, treat it as incorrect
+        processed_preds = []
+        for pred, target in zip(clean_preds, clean_targets):
+            # If prediction is not a valid option, replace it with a value that ensures it will be wrong
+            # by using the "other" valid option (different from the target)
+            if pred not in valid_options:
+                # Find the option that's different from the target to ensure it's counted as wrong
+                wrong_option = valid_options[0] if target == valid_options[1] else valid_options[1]
+                processed_preds.append(wrong_option)
+            else:
+                processed_preds.append(pred)
+        
+        # Calculate accuracy (percentage of correct predictions)
+        correct = sum(1 for p, t in zip(processed_preds, clean_targets) if p == t)
+        accuracy = correct / len(clean_targets) if len(clean_targets) > 0 else 0
+        
+        # Use the first valid option as the positive class for binary F1 calculation
+        positive_class = valid_options[0]
+        
+        binary_targets = [1 if t == positive_class else 0 for t in clean_targets]
+        binary_preds = [1 if p == positive_class else 0 for p in processed_preds]
+        
+        # Calculate F1 score
+        f1 = f1_score(binary_targets, binary_preds)
+        
+        return {"f1_score": f1, "accuracy": accuracy}
     
     elif metric_type == 'mcc':
-        # For linguistic_acceptability where Matthews Correlation Coefficient works well with imbalance
-        # Convert text classes to numerical if needed
-        unique_classes = sorted(list(set(clean_targets + clean_preds)))
-        class_to_idx = {c: i for i, c in enumerate(unique_classes)}
+        # First, identify the valid options from the target outputs
+        unique_targets = sorted(list(set(clean_targets)))
         
+        # Verify that we have a binary classification task
+        if len(unique_targets) != 2:
+            print(f"Warning: Expected binary classification (2 classes), but found {len(unique_targets)} classes in targets.")
+            # Fall back to accuracy if it's not binary classification
+            correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
+            accuracy = correct / len(targets) if len(targets) > 0 else 0
+            return {"accuracy": accuracy}
+        
+        # Valid options are the two unique values from the target outputs
+        valid_options = unique_targets
+        
+        # Process predictions - if a prediction is not in valid options, treat it as incorrect
+        processed_preds = []
+        for pred, target in zip(clean_preds, clean_targets):
+            # If prediction is not a valid option, replace it with a value that ensures it will be wrong
+            # by using the "other" valid option (different from the target)
+            if pred not in valid_options:
+                # Find the option that's different from the target to ensure it's counted as wrong
+                wrong_option = valid_options[0] if target == valid_options[1] else valid_options[1]
+                processed_preds.append(wrong_option)
+            else:
+                processed_preds.append(pred)
+        
+        # Create mapping from text classes to numerical indices
+        class_to_idx = {c: i for i, c in enumerate(valid_options)}
+        
+        # Convert text classes to indices for MCC calculation
         target_indices = [class_to_idx[t] for t in clean_targets]
-        pred_indices = [class_to_idx[p] for p in clean_preds]
+        pred_indices = [class_to_idx[p] for p in processed_preds]
         
+        # Calculate MCC
         mcc = matthews_corrcoef(target_indices, pred_indices)
         
         # Also include accuracy for comparison
-        correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
+        correct = sum(1 for p, t in zip(processed_preds, clean_targets) if p == t)
         accuracy = correct / len(targets) if len(targets) > 0 else 0
         
         return {"mcc": mcc, "accuracy": accuracy}
