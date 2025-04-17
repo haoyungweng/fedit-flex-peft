@@ -1,0 +1,45 @@
+{
+  "paraphrase": {
+    "f1_score": 0.7789473684210526,
+    "accuracy": 0.685
+  },
+  "entailment": {
+    "accuracy": 0.5
+  },
+  "text_formatting": {
+    "rouge1": 0.905850773700043,
+    "rouge2": 0.862287614940932,
+    "rougeL": 0.9040297678018793,
+    "rougeLsum": 0.9045840901398562
+  },
+  "structure_to_text": {
+    "rouge1": 0.5206340041765345,
+    "rouge2": 0.29902916942149244,
+    "rougeL": 0.42128553126861457,
+    "rougeLsum": 0.42255606618146635
+  },
+  "linguistic_acceptability": {
+    "mcc": 0.3045173036199734,
+    "accuracy": 0.65
+  },
+  "word_disambiguation": {
+    "f1_score": 0.6592592592592592,
+    "accuracy": 0.54
+  },
+  "coreference": {
+    "accuracy": 0.565
+  },
+  "question_classification": {
+    "accuracy": 0.795
+  },
+  "overall": {
+    "overall_accuracy": 0.6225,
+    "avg_f1_score": 0.7191033138401559,
+    "avg_accuracy": 0.6224999999999999,
+    "avg_rouge1": 0.7132423889382887,
+    "avg_rouge2": 0.5806583921812122,
+    "avg_rougeL": 0.662657649535247,
+    "avg_rougeLsum": 0.6635700781606613,
+    "avg_mcc": 0.3045173036199734
+  }
+}
