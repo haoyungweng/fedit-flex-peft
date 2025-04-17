@@ -76,12 +76,18 @@ def compute_rouge_scores(targets: List[str], predictions: List[str]) -> Dict:
     """
     rouge = evaluate.load("rouge")
     results = rouge.compute(predictions=predictions, references=targets)
-    return results
+    return {
+        "rouge1": results["rouge1"],
+        "rouge2": results["rouge2"],
+        "rougeL": results["rougeL"],
+        "rougeLsum": results["rougeLsum"]
+    }
 
 
 def compute_scores(targets: List[str], predictions: List[str], metric_type: str) -> Dict:
     """
     Compute scores between target and prediction texts based on the appropriate metric.
+    Always includes Rouge metrics for all tasks.
     
     Args:
         targets: List of reference texts
@@ -89,32 +95,29 @@ def compute_scores(targets: List[str], predictions: List[str], metric_type: str)
         metric_type: Type of metric to use ('rouge', 'accuracy', 'f1', 'mcc', etc.)
         
     Returns:
-        Dictionary of metric results
+        Dictionary of metric results including Rouge metrics
     """
     # Normalize text to account for whitespace/case differences
     clean_preds = [p.strip().lower() for p in predictions]
     clean_targets = [t.strip().lower() for t in targets]
     
-    if metric_type == 'rouge':
-        # For text generation tasks (structure-to-text, text_formatting)
-        rouge = evaluate.load("rouge")
-        results = rouge.compute(predictions=predictions, references=targets)
-        
-        # Include the most relevant ROUGE metrics for these tasks
-        return {
-            "rouge1": results["rouge1"],
-            "rouge2": results["rouge2"],
-            "rougeL": results["rougeL"],
-            "rougeLsum": results["rougeLsum"]
-        }
+    # Always compute Rouge metrics for all tasks
+    rouge_results = compute_rouge_scores(targets, predictions)
     
-    elif metric_type == 'accuracy':
+    # For tasks that already use Rouge, just return the Rouge metrics
+    if metric_type == 'rouge':
+        return rouge_results
+    
+    # For other metrics, compute both the original metric and Rouge
+    results = {}
+    
+    if metric_type == 'accuracy':
         # For classification tasks with balanced classes (entailment, question_classification)
         correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
         accuracy = correct / len(targets) if len(targets) > 0 else 0
         
-        return {"accuracy": accuracy}
-    
+        results["accuracy"] = accuracy
+        
     elif metric_type == 'f1':
         # First, identify the valid options from the target outputs
         unique_targets = sorted(list(set(clean_targets)))
@@ -125,38 +128,39 @@ def compute_scores(targets: List[str], predictions: List[str], metric_type: str)
             # Fall back to accuracy if it's not binary classification
             correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
             accuracy = correct / len(targets) if len(targets) > 0 else 0
-            return {"accuracy": accuracy}
+            results["accuracy"] = accuracy
+        else:
+            # Valid options are the two unique values from the target outputs
+            valid_options = unique_targets
+            
+            # Process predictions - if a prediction is not in valid options, treat it as incorrect
+            processed_preds = []
+            for pred, target in zip(clean_preds, clean_targets):
+                # If prediction is not a valid option, replace it with a value that ensures it will be wrong
+                # by using the "other" valid option (different from the target)
+                if pred not in valid_options:
+                    # Find the option that's different from the target to ensure it's counted as wrong
+                    wrong_option = valid_options[0] if target == valid_options[1] else valid_options[1]
+                    processed_preds.append(wrong_option)
+                else:
+                    processed_preds.append(pred)
+            
+            # Calculate accuracy (percentage of correct predictions)
+            correct = sum(1 for p, t in zip(processed_preds, clean_targets) if p == t)
+            accuracy = correct / len(clean_targets) if len(clean_targets) > 0 else 0
+            
+            # Use the first valid option as the positive class for binary F1 calculation
+            positive_class = valid_options[0]
+            
+            binary_targets = [1 if t == positive_class else 0 for t in clean_targets]
+            binary_preds = [1 if p == positive_class else 0 for p in processed_preds]
+            
+            # Calculate F1 score
+            f1 = f1_score(binary_targets, binary_preds)
+            
+            results["f1_score"] = f1
+            results["accuracy"] = accuracy
         
-        # Valid options are the two unique values from the target outputs
-        valid_options = unique_targets
-        
-        # Process predictions - if a prediction is not in valid options, treat it as incorrect
-        processed_preds = []
-        for pred, target in zip(clean_preds, clean_targets):
-            # If prediction is not a valid option, replace it with a value that ensures it will be wrong
-            # by using the "other" valid option (different from the target)
-            if pred not in valid_options:
-                # Find the option that's different from the target to ensure it's counted as wrong
-                wrong_option = valid_options[0] if target == valid_options[1] else valid_options[1]
-                processed_preds.append(wrong_option)
-            else:
-                processed_preds.append(pred)
-        
-        # Calculate accuracy (percentage of correct predictions)
-        correct = sum(1 for p, t in zip(processed_preds, clean_targets) if p == t)
-        accuracy = correct / len(clean_targets) if len(clean_targets) > 0 else 0
-        
-        # Use the first valid option as the positive class for binary F1 calculation
-        positive_class = valid_options[0]
-        
-        binary_targets = [1 if t == positive_class else 0 for t in clean_targets]
-        binary_preds = [1 if p == positive_class else 0 for p in processed_preds]
-        
-        # Calculate F1 score
-        f1 = f1_score(binary_targets, binary_preds)
-        
-        return {"f1_score": f1, "accuracy": accuracy}
-    
     elif metric_type == 'mcc':
         # First, identify the valid options from the target outputs
         unique_targets = sorted(list(set(clean_targets)))
@@ -167,43 +171,49 @@ def compute_scores(targets: List[str], predictions: List[str], metric_type: str)
             # Fall back to accuracy if it's not binary classification
             correct = sum(1 for p, t in zip(clean_preds, clean_targets) if p == t)
             accuracy = correct / len(targets) if len(targets) > 0 else 0
-            return {"accuracy": accuracy}
-        
-        # Valid options are the two unique values from the target outputs
-        valid_options = unique_targets
-        
-        # Process predictions - if a prediction is not in valid options, treat it as incorrect
-        processed_preds = []
-        for pred, target in zip(clean_preds, clean_targets):
-            # If prediction is not a valid option, replace it with a value that ensures it will be wrong
-            # by using the "other" valid option (different from the target)
-            if pred not in valid_options:
-                # Find the option that's different from the target to ensure it's counted as wrong
-                wrong_option = valid_options[0] if target == valid_options[1] else valid_options[1]
-                processed_preds.append(wrong_option)
-            else:
-                processed_preds.append(pred)
-        
-        # Create mapping from text classes to numerical indices
-        class_to_idx = {c: i for i, c in enumerate(valid_options)}
-        
-        # Convert text classes to indices for MCC calculation
-        target_indices = [class_to_idx[t] for t in clean_targets]
-        pred_indices = [class_to_idx[p] for p in processed_preds]
-        
-        # Calculate MCC
-        mcc = matthews_corrcoef(target_indices, pred_indices)
-        
-        # Also include accuracy for comparison
-        correct = sum(1 for p, t in zip(processed_preds, clean_targets) if p == t)
-        accuracy = correct / len(targets) if len(targets) > 0 else 0
-        
-        return {"mcc": mcc, "accuracy": accuracy}
+            results["accuracy"] = accuracy
+        else:
+            # Valid options are the two unique values from the target outputs
+            valid_options = unique_targets
+            
+            # Process predictions - if a prediction is not in valid options, treat it as incorrect
+            processed_preds = []
+            for pred, target in zip(clean_preds, clean_targets):
+                # If prediction is not a valid option, replace it with a value that ensures it will be wrong
+                # by using the "other" valid option (different from the target)
+                if pred not in valid_options:
+                    # Find the option that's different from the target to ensure it's counted as wrong
+                    wrong_option = valid_options[0] if target == valid_options[1] else valid_options[1]
+                    processed_preds.append(wrong_option)
+                else:
+                    processed_preds.append(pred)
+            
+            # Create mapping from text classes to numerical indices
+            class_to_idx = {c: i for i, c in enumerate(valid_options)}
+            
+            # Convert text classes to indices for MCC calculation
+            target_indices = [class_to_idx[t] for t in clean_targets]
+            pred_indices = [class_to_idx[p] for p in processed_preds]
+            
+            # Calculate MCC
+            mcc = matthews_corrcoef(target_indices, pred_indices)
+            
+            # Also include accuracy for comparison
+            correct = sum(1 for p, t in zip(processed_preds, clean_targets) if p == t)
+            accuracy = correct / len(targets) if len(targets) > 0 else 0
+            
+            results["mcc"] = mcc
+            results["accuracy"] = accuracy
     
     else:
-        # Default to ROUGE if unknown metric type
+        # Unknown metric type - use original implementation (default to ROUGE)
         print(f"Warning: Unknown metric type '{metric_type}', using ROUGE")
-        return compute_rouge_scores(targets, predictions)
+        return rouge_results
+    
+    # Add Rouge metrics to the results
+    results.update(rouge_results)
+    
+    return results
 
 
 def evaluate_results(
@@ -291,7 +301,8 @@ def evaluate_results(
     for category, scores in results.items():
         if category != "overall":
             metric_used = TASK_METRICS.get(category, "rouge")
-            print(f"{category} (evaluated with {metric_used}):")
+            # Modified to show that other metrics are included alongside the primary metric
+            print(f"{category} (primary metric: {metric_used}, with additional Rouge metrics):")
             for metric, value in scores.items():
                 print(f"  {metric}: {value:.4f}")
     
