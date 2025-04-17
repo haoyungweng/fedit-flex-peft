@@ -13,14 +13,14 @@ from sklearn.metrics import f1_score, matthews_corrcoef
 
 # Updated metrics for each task type
 TASK_METRICS = {
-    "entailment": "accuracy",              # Classification task
-    "paraphrase": "f1",                    # Classification task - F1 is better for potential imbalance
-    "text_formatting": "rouge",            # Generation task
-    "structure_to_text": "rouge",          # Generation task
-    "linguistic_acceptability": "mcc",     # Classification task - MCC handles imbalance better
-    "word_disambiguation": "f1",           # Classification task - F1 for potential class imbalance
-    "coreference": "accuracy",             # Classification task
-    "question_classification": "accuracy"  # Classification task
+    "entailment": "accuracy",                 # Classification task
+    "paraphrase": "f1",                       # Classification task
+    "text_formatting": "rouge",               # Generation task
+    "structure_to_text": "rouge",             # Generation task
+    "linguistic_acceptability": "accuracy",   # Classification task
+    "word_disambiguation": "f1",              # Classification task
+    "coreference": "accuracy",                # Classification task
+    "question_classification": "accuracy"     # Classification task
 }
 
 
