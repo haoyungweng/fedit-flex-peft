@@ -22,7 +22,7 @@ from peft import (
     set_peft_model_state_dict
 )
 import datasets
-import wandb # Import wandb
+import wandb # Ensure wandb is imported
 from fed_utils import (
     fedavg,
     hetlora,
@@ -191,19 +191,19 @@ def fl_finetune(
     # Prepare client LoRA ranks
     client_lora_ranks = {}
     if use_hetlora:
-        ranks = [8, 6, 4]
-        num_rank_categories = len(ranks)
-        base_count = num_clients // num_rank_categories
-        remainder = num_clients % num_rank_categories
+        # ranks = [8, 6, 4]
+        # num_rank_categories = len(ranks)
+        # base_count = num_clients // num_rank_categories
+        # remainder = num_clients % num_rank_categories
 
-        counts = [base_count + 1 if i < remainder else base_count
-                for i in range(num_rank_categories)]
-        rank_assignments = [rank for i, rank in enumerate(ranks)
-                             for _ in range(counts[i])]
-        # rank_assignments = [4, 8, 8, 8, 8, 8, 8, 8]
+        # counts = [base_count + 1 if i < remainder else base_count
+        #         for i in range(num_rank_categories)]
+        # rank_assignments = [rank for i, rank in enumerate(ranks)
+        #                      for _ in range(counts[i])]
+        rank_assignments = [6, 8, 6, 4, 4, 8, 4, 6]
         
-        random.seed(309)  # For reproducibility
-        random.shuffle(rank_assignments)
+        # random.seed(309)  # For reproducibility
+        # random.shuffle(rank_assignments)
         
         client_lora_ranks = dict(enumerate(rank_assignments))
         print("Using HetLoRA with client ranks:", client_lora_ranks)
@@ -339,9 +339,11 @@ def fl_finetune(
 
         if use_federation:
             print("\n======= Aggregating client models =======")
+            client_sparsity_scores = None # Initialize sparsity scores dict
             if use_hetlora:
                 print("Using HetLoRA sparsity-weighted aggregation")
-                global_params = hetlora(
+                # Unpack the returned values
+                global_params, client_sparsity_scores = hetlora(
                     global_params,
                     selected_clients,
                     model_output_dir,
@@ -358,7 +360,17 @@ def fl_finetune(
                     local_dataset_len_dict,
                     epoch
                 )
-            
+
+            # Log sparsity scores if available (only on rank 0)
+            if client_sparsity_scores and int(os.environ.get("LOCAL_RANK", 0)) == 0:
+                log_dict = {}
+                for client_id, score in client_sparsity_scores.items():
+                    log_dict[f"sparsity_score/client_{client_id}"] = score
+                # Log all scores for the current round (step)
+                wandb.log(log_dict, step=epoch)
+                print(f"Logged sparsity scores for round {epoch} to wandb.")
+
+            # ... rest of the federation block (saving global params, etc.) ...
             round_dir = os.path.join(model_output_dir, str(epoch))
             os.makedirs(round_dir, exist_ok=True)
             global_params_path = os.path.join(round_dir, "global_adapter_model.bin")
