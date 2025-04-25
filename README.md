@@ -1,6 +1,6 @@
 # FedIT-flex-PEFT
 
-Final project for CMU 10-623: Generative AI. A flexible framework for federated learning with parameter-efficient fine-tuning of language models.
+A flexible framework for federated learning with parameter-efficient fine-tuning of language models.
 
 ## Project Overview
 
