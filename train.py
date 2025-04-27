@@ -48,8 +48,9 @@ def fl_finetune(
         client_selection_frac: float = 0.1,
         num_communication_rounds: int = 20,
         num_clients: int = 8,
-        # Federation mode
-        federation_mode: str = "homo",  # "none", "homo", or "hetero"
+        # Federation params
+        use_federation: bool = True, # If True, aggregate models; otherwise, train clients independently
+        use_hetero: bool = False,   # If True, use heterogeneous ranks (and HetLoRA aggregation if use_federation=True)
         # Local training hyperparams
         local_batch_size: int = 128,
         local_micro_batch_size: int = 8,
@@ -59,7 +60,7 @@ def fl_finetune(
         val_data_path: str = "",
         cutoff_len: int = 512,
         # LoRA hyperparams
-        lora_r: int = 4,
+        lora_r: int = 4, # Base rank, used if use_hetero=False
         lora_alpha: int = 16,
         lora_dropout: float = 0.05,
         lora_target_modules: List[str] = [
@@ -71,8 +72,8 @@ def fl_finetune(
         group_by_length: bool = False
 ):
     """
-    Train a language model using federated learning.
-    
+    Train a language model using federated or isolated client learning.
+
     Args:
         exp_name: Experiment name
         base_model: Base model to fine-tune
@@ -82,7 +83,11 @@ def fl_finetune(
         client_selection_frac: Fraction of clients to select
         num_communication_rounds: Number of communication rounds
         num_clients: Total number of clients
-        federation_mode: Federation strategy ("none", "homo", or "hetero")
+        use_federation: If True, perform federated aggregation (FedAvg or HetLoRA).
+                        If False, clients train independently and save their own models.
+        use_hetero: If True, clients use potentially different LoRA ranks (hardcoded).
+                    If use_federation is also True, HetLoRA aggregation is used.
+                    If False, all clients use the base 'lora_r'.
         local_batch_size: Batch size for local training
         local_micro_batch_size: Micro batch size for gradient accumulation
         local_num_epochs: Number of epochs for local training
@@ -90,19 +95,27 @@ def fl_finetune(
         local_val_set_size: Size of validation set (0 for no validation)
         val_data_path: Path to validation data
         cutoff_len: Maximum sequence length
-        lora_r: LoRA rank
+        lora_r: Base LoRA rank (used when use_hetero=False)
         lora_alpha: LoRA alpha
         lora_dropout: LoRA dropout
         lora_target_modules: Target modules for LoRA
         train_on_inputs: Whether to train on inputs
         group_by_length: Whether to group sequences by length
     """
-    # Validate federation mode
-    assert federation_mode in ["none", "homo", "hetero"], \
-        "federation_mode must be one of 'none', 'homo', or 'hetero'"
+    # --- Mode Description ---
+    mode_description = ""
+    if use_federation:
+        if use_hetero:
+            mode_description = "Federated Heterogeneous (HetLoRA)"
+        else:
+            mode_description = "Federated Homogeneous (FedAvg)"
+    else:
+        if use_hetero:
+            mode_description = "Isolated Clients (Heterogeneous Ranks)"
+        else:
+            mode_description = "Isolated Clients (Homogeneous Ranks)"
+    print(f"Running in mode: {mode_description}")
 
-    use_hetlora = (federation_mode == "hetero")
-    use_federation = (federation_mode in ["homo", "hetero"])
 
     # Create experiment output directory
     model_output_dir = os.path.join(model_dir, exp_name)
@@ -110,17 +123,26 @@ def fl_finetune(
 
     # Initialize wandb only on the main process (rank 0)
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-        wandb.init(project=exp_name, name=exp_name) # Initialize wandb
+        wandb.init(project='10623 Project', name=exp_name) # Initialize wandb
+        # Define a custom step metric for communication rounds
+        wandb.define_metric("communication_round")
+        # Define metrics that use the custom step metric (only if federating)
+        if use_federation:
+            wandb.define_metric("val_loss", step_metric="communication_round")
+            if use_hetero:
+                wandb.define_metric("sparsity_score/*", step_metric="communication_round")
+                wandb.define_metric("aggregation_weight/*", step_metric="communication_round")
         print(
-            f"Federated Fine-tuning with:\n"
+            f"Fine-tuning with:\n"
             f"Experiment: {exp_name}\n"
             f"Model: {base_model}\n"
             f"Data: {data_path}\n"
             f"Output: {model_output_dir}\n"
-            f"Federation mode: {federation_mode}\n"
+            f"Mode: {mode_description}\n"
             f"Clients: {num_clients} (selection: {client_selection_frac:.2f} using {client_selection_strategy})\n"
             f"Communication rounds: {num_communication_rounds}\n"
-            f"LoRA: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}\n"
+            f"Base LoRA: r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}\n"
+            f"Heterogeneous Ranks Active: {use_hetero}\n"
         )
 
     # Verify model and data paths
@@ -164,6 +186,7 @@ def fl_finetune(
         result["labels"] = result["input_ids"].copy()
         return result
 
+
     # Data preprocessing function
     def generate_and_tokenize_prompt(data_point):
         full_prompt = prompter.generate_prompt(
@@ -172,10 +195,10 @@ def fl_finetune(
             data_point["output"],
         )
         tokenized_full_prompt = tokenize(full_prompt)
-        
+
         if not train_on_inputs:
             user_prompt = prompter.generate_prompt(
-                data_point["instruction"], 
+                data_point["instruction"],
                 data_point["input"] if 'input' in data_point.keys() else None,
             )
             tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
@@ -188,52 +211,52 @@ def fl_finetune(
             ]
         return tokenized_full_prompt
 
-    # Prepare client LoRA ranks
-    client_lora_ranks = {}
-    if use_hetlora:
-        # ranks = [8, 6, 4]
-        # num_rank_categories = len(ranks)
-        # base_count = num_clients // num_rank_categories
-        # remainder = num_clients % num_rank_categories
 
-        # counts = [base_count + 1 if i < remainder else base_count
-        #         for i in range(num_rank_categories)]
-        # rank_assignments = [rank for i, rank in enumerate(ranks)
-        #                      for _ in range(counts[i])]
-        rank_assignments = [6, 8, 6, 4, 4, 8, 4, 6]
-        
-        # random.seed(309)  # For reproducibility
-        # random.shuffle(rank_assignments)
-        
-        client_lora_ranks = dict(enumerate(rank_assignments))
-        print("Using HetLoRA with client ranks:", client_lora_ranks)
+    # Prepare client LoRA ranks and determine effective global rank
+    client_lora_ranks = {}
+    effective_global_rank = lora_r # Default global rank
+
+    if use_hetero:
+        # Assign potentially heterogeneous ranks (hardcoded example)
+        if num_clients == 8:
+            final_rank_assignments = [6, 8, 4, 4, 6, 8, 6, 6]
+        else:
+            # Fallback: assign base rank if not 8 clients (or implement other logic)
+            print(f"Warning: Using base rank {lora_r} for all clients as num_clients is not 8 and use_hetero=True.")
+            final_rank_assignments = [lora_r] * num_clients
+
+        client_lora_ranks = dict(enumerate(final_rank_assignments))
+        print(f"Using heterogeneous ranks: {client_lora_ranks}")
         rank_distribution = {}
         for rank in client_lora_ranks.values():
             rank_distribution[rank] = rank_distribution.get(rank, 0) + 1
         print("Rank distribution:", rank_distribution)
-        global_rank = max(client_lora_ranks.values())
-        print(f"Global rank set to {global_rank} (max of all client ranks)")
+        # Determine the max rank needed for global model structure (if federating)
+        effective_global_rank = max(client_lora_ranks.values()) if client_lora_ranks else lora_r
+        print(f"Effective global rank set to {effective_global_rank} (max of client ranks)")
     else:
-        global_rank = lora_r
+        # Assign homogeneous ranks
+        effective_global_rank = lora_r # Use the provided base lora_r
         for client_id in range(num_clients):
             client_lora_ranks[client_id] = lora_r
         print(f"Using homogeneous LoRA with rank {lora_r} for all clients")
 
-    # Initialize global parameters state dict (structure only)
+    # Initialize global parameters state dict (only if federating)
     global_params = None
     if use_federation:
         print("Initializing structure for global adapter state dict...")
+        # Use effective_global_rank for the structure
         temp_bnb_config = BitsAndBytesConfig(load_in_8bit=True)
         temp_base_model = AutoModelForCausalLM.from_pretrained(
             base_model,
             quantization_config=temp_bnb_config,
             torch_dtype=torch.float16,
-            device_map="cpu",
+            device_map="cpu", # Load to CPU for structure init
         )
         temp_base_model = prepare_model_for_kbit_training(temp_base_model)
 
         temp_global_config = LoraConfig(
-            r=global_rank,
+            r=effective_global_rank, # Use the determined global rank
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
             lora_dropout=lora_dropout,
@@ -242,17 +265,17 @@ def fl_finetune(
         )
         temp_peft_model = get_peft_model(temp_base_model, temp_global_config)
         global_params = get_peft_model_state_dict(temp_peft_model, adapter_name="default")
-        global_params = {k: v.to('cpu') for k, v in global_params.items()}
+        global_params = {k: v.to('cpu') for k, v in global_params.items()} # Keep on CPU
 
         del temp_peft_model
         del temp_base_model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print("Global adapter state dict structure initialized and temporary models deleted.")
+        print(f"Global adapter state dict structure initialized with rank {effective_global_rank}.")
 
-    # Start federated training
-    print(f"Starting {'federated' if use_federation else 'isolated'} training...")
+    # Start training loop
+    print(f"Starting training ({mode_description})...")
 
     previously_selected_clients = set()
     last_client_id = None
@@ -260,18 +283,19 @@ def fl_finetune(
 
     for epoch in tqdm(range(num_communication_rounds), desc="Communication Rounds"):
         print(f"\nRound {epoch+1}/{num_communication_rounds}")
-        
+
         selected_clients = select_clients(
-            num_clients, 
-            client_selection_frac, 
+            num_clients,
+            client_selection_frac,
             client_selection_strategy,
-            seed=epoch
+            seed=epoch # Use epoch for reproducibility
         )
 
         for client_id in selected_clients:
-            client_rank = client_lora_ranks[client_id]
-            print(f"\nClient {client_id}: Using LoRA rank {client_rank}")
-            
+            # --- Client Setup ---
+            client_rank = client_lora_ranks[client_id] # Get assigned rank
+            print(f"\n--- Processing Client {client_id} (Rank: {client_rank}) ---")
+
             client_config = LoraConfig(
                 r=client_rank,
                 lora_alpha=lora_alpha,
@@ -280,7 +304,8 @@ def fl_finetune(
                 bias="none",
                 task_type="CAUSAL_LM",
             )
-            
+
+            # Load base model and apply PEFT config
             temp_bnb_config = BitsAndBytesConfig(load_in_8bit=True)
             base_model_obj = AutoModelForCausalLM.from_pretrained(
                 base_model,
@@ -289,149 +314,217 @@ def fl_finetune(
                 device_map="auto" if not ddp else {"": int(os.environ.get("LOCAL_RANK") or 0)},
             )
             base_model_obj = prepare_model_for_kbit_training(base_model_obj)
-            
+
             client_model = get_peft_model(
-                base_model_obj, 
+                base_model_obj,
                 client_config,
                 adapter_name="default"
             )
-            
-            if use_federation and epoch > 0:
-                if use_hetlora:
-                    print(f"Client {client_id}: Loading weights from global parameters (heterogeneous)")
-                    client_weights = load_hetlora_weights(
-                        client_config,
-                        global_params,
-                        client_rank
-                    )
-                    set_peft_model_state_dict(client_model, client_weights, "default")
-                else:
-                    print(f"Client {client_id}: Loading weights from global parameters (homogeneous)")
-                    set_peft_model_state_dict(client_model, global_params, "default")
-                
-            client = FederatedClient(client_id, client_model, client_data_path, model_output_dir)
-            
-            print(f"Preparing client {client_id} for training")
-            client.prepare_dataset(generate_and_tokenize_prompt, local_val_set_size)
-            client.build_trainer(
+
+            # --- Load Previous State ---
+            if epoch > 0:
+                if use_federation:
+                    # Load from global model (potentially truncated)
+                    if use_hetero: # Check the flag for heterogeneous mode
+                        print(f"Client {client_id}: Loading weights from global parameters (heterogeneous)")
+                        if global_params is None:
+                             raise RuntimeError("Global parameters are not initialized for HetLoRA loading.")
+                        client_weights = load_hetlora_weights(
+                            client_config, # Target config for truncation
+                            global_params, # Current global state
+                            client_rank    # Target rank
+                        )
+                        set_peft_model_state_dict(client_model, client_weights, "default")
+                        del client_weights # Free memory
+                    else: # Homogeneous federation
+                        print(f"Client {client_id}: Loading weights from global parameters (homogeneous)")
+                        if global_params is None:
+                            raise RuntimeError("Global parameters are not initialized for FedAvg loading.")
+                        set_peft_model_state_dict(client_model, global_params, "default")
+                else: # Not federating, load client's own previous state
+                    print(f"Client {client_id}: Attempting to load saved state from round {epoch - 1} (Federation OFF)")
+                    prev_round_client_dir = os.path.join(model_output_dir, str(epoch - 1), f"client_{client_id}")
+                    weights_path = os.path.join(prev_round_client_dir, "adapter_model.bin")
+
+                    if os.path.exists(weights_path):
+                        try:
+                            saved_weights = torch.load(weights_path, map_location="cpu") # Load to CPU first
+                            set_peft_model_state_dict(client_model, saved_weights, "default")
+                            print(f"Client {client_id}: Successfully loaded weights from {weights_path}")
+                            del saved_weights # Free memory
+                        except Exception as e:
+                            print(f"Client {client_id}: Error loading weights from {weights_path}: {e}. Starting fresh.")
+                    else:
+                        print(f"Client {client_id}: No saved weights found at {weights_path}. Starting fresh for this client.")
+
+            # --- Client Training ---
+            client_obj = FederatedClient(client_id, client_model, client_data_path, model_output_dir)
+
+            print(f"Preparing client {client_id} dataset...")
+            client_obj.prepare_dataset(generate_and_tokenize_prompt, local_val_set_size)
+            print(f"Building trainer for client {client_id}...")
+            client_obj.build_trainer(
                 tokenizer,
                 local_micro_batch_size,
                 gradient_accumulation_steps,
                 local_num_epochs,
                 local_learning_rate,
                 group_by_length,
-                ddp
+                ddp # Pass DDP flag
             )
 
-            print(f"Training client {client_id}")
-            client.train()
+            print(f"Starting training for client {client_id}...")
+            client_obj.train()
 
-            print(f"Saving model for client {client_id}")
-            local_dataset_len_dict, previously_selected_clients, last_client_id = client.save_client_state(
+            # --- Save Client State ---
+            print(f"Saving model/state for client {client_id} for round {epoch}")
+            # save_client_state now saves the model and config in the round-specific client dir
+            local_dataset_len_dict, previously_selected_clients, last_client_id = client_obj.save_client_state(
                 epoch, local_dataset_len_dict, previously_selected_clients
             )
-            
-            del client
+
+            # --- Cleanup ---
+            del client_obj
             del client_model
+            del base_model_obj # Explicitly delete base model too
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            print(f"--- Finished Processing Client {client_id} ---")
 
+        # --- Aggregation Step (only if use_federation is True) ---
         if use_federation:
-            print("\n======= Aggregating client models =======")
-            client_sparsity_scores = None # Initialize sparsity scores dict
-            if use_hetlora:
-                print("Using HetLoRA sparsity-weighted aggregation")
-                # Unpack the returned values
-                global_params, client_sparsity_scores = hetlora(
-                    global_params,
-                    selected_clients,
-                    model_output_dir,
-                    local_dataset_len_dict,
-                    epoch,
-                    client_lora_ranks
+            print("\n======= Aggregating Client Models =======")
+            client_sparsity_scores = None # Initialize for logging
+            client_aggregation_weights = None # Initialize for logging
+
+            # Check if any clients were selected
+            if not selected_clients: # Use the selected_clients list directly
+                print("Warning: No clients were selected. Skipping aggregation for this round.")
+            elif use_hetero: # Check the flag for heterogeneous mode
+                print("Using HetLoRA sparsity-weighted aggregation (loading from disk)")
+                # Pass info needed for disk loading
+                global_params, client_sparsity_scores, client_aggregation_weights = hetlora(
+                    global_params,             # Current global state
+                    set(selected_clients),     # Pass the set of selected client IDs
+                    model_output_dir,          # Base output directory
+                    local_dataset_len_dict,    # Data lengths for weighting
+                    epoch,                     # Current epoch/round number
+                    client_lora_ranks,         # Ranks of ALL clients
+                    effective_global_rank      # The target rank for the aggregated model
                 )
-            else:
-                print("Using FedAvg homogeneous aggregation")
+            else: # Homogeneous FedAvg
+                print("Using FedAvg homogeneous aggregation (loading from disk)")
+                # Pass info needed for disk loading
                 global_params = fedavg(
-                    global_params,
-                    selected_clients,
-                    model_output_dir,
-                    local_dataset_len_dict,
-                    epoch
+                    global_params,             # Current global state
+                    set(selected_clients),     # Pass the set of selected client IDs
+                    model_output_dir,          # Base output directory
+                    local_dataset_len_dict,    # Data lengths for weighting
+                    epoch                      # Current epoch/round number
                 )
 
-            # Log sparsity scores if available (only on rank 0)
-            if client_sparsity_scores and int(os.environ.get("LOCAL_RANK", 0)) == 0:
-                log_dict = {}
-                for client_id, score in client_sparsity_scores.items():
-                    log_dict[f"sparsity_score/client_{client_id}"] = score
-                # Log all scores for the current round (step)
-                wandb.log(log_dict, step=epoch)
-                print(f"Logged sparsity scores for round {epoch} to wandb.")
+            # Log scores and weights if available (only on rank 0)
+            if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+                log_dict = {"communication_round": epoch} # Use epoch (0-based) for step
 
-            # ... rest of the federation block (saving global params, etc.) ...
-            round_dir = os.path.join(model_output_dir, str(epoch))
-            os.makedirs(round_dir, exist_ok=True)
-            global_params_path = os.path.join(round_dir, "global_adapter_model.bin")
-            torch.save(global_params, global_params_path)
-            print(f"Saved global parameters to {global_params_path}")
-            
-            global_config = LoraConfig(
-                r=global_rank,
-                lora_alpha=lora_alpha,
-                target_modules=lora_target_modules,
-                lora_dropout=lora_dropout,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            config_path = os.path.join(round_dir)
-            global_config.save_pretrained(config_path)
-            print(f"Saved global config with rank {global_rank} to {config_path}")
-        else:
-            print("\nNo federation: client models saved individually")
+                # Log sparsity scores if HetLoRA was used
+                if use_hetero and client_sparsity_scores:
+                    for cid, score in client_sparsity_scores.items():
+                        log_dict[f"sparsity_score/client_{cid}"] = score
+                    print(f"Prepared sparsity scores for round {epoch} for wandb.")
 
-        if val_data_path:
-            try:
-                print("\nEvaluating global model on validation data...")
-                temp_bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-                base_model_obj = AutoModelForCausalLM.from_pretrained(
-                    base_model,
-                    quantization_config=temp_bnb_config,
-                    torch_dtype=torch.float16,
-                    device_map="auto" if not ddp else {"": int(os.environ.get("LOCAL_RANK") or 0)},
-                )
-                base_model_obj = prepare_model_for_kbit_training(base_model_obj)
-                
-                eval_config = LoraConfig(
-                    r=global_rank,
+                # Log aggregation weights if HetLoRA was used
+                if use_hetero and client_aggregation_weights:
+                    for cid, weight in client_aggregation_weights.items():
+                        log_dict[f"aggregation_weight/client_{cid}"] = weight
+                    print(f"Prepared aggregation weights for round {epoch} for wandb.")
+
+                # Log collected metrics for the current round if any exist besides the round number
+                if len(log_dict) > 1:
+                    wandb.log(log_dict)
+                    print(f"Logged aggregation metrics for round {epoch} to wandb.")
+
+            if selected_clients and global_params is not None: # Save if clients were selected and aggregation produced a result
+                round_dir = os.path.join(model_output_dir, str(epoch))
+                os.makedirs(round_dir, exist_ok=True) # Ensure round dir exists
+
+                global_params_path = os.path.join(round_dir, "global_adapter_model.bin")
+                torch.save(global_params, global_params_path)
+                print(f"Saved aggregated global parameters to {global_params_path}")
+
+                # Save the config corresponding to the aggregated global model
+                global_config = LoraConfig(
+                    r=effective_global_rank, # Rank of the saved global model
                     lora_alpha=lora_alpha,
                     target_modules=lora_target_modules,
                     lora_dropout=lora_dropout,
                     bias="none",
                     task_type="CAUSAL_LM",
                 )
-                eval_model = get_peft_model(base_model_obj, eval_config)
-                
-                set_peft_model_state_dict(eval_model, global_params, "default")
-                
-                eval_loss = evaluate_global_model(
-                    eval_model, 
-                    val_data_path, 
-                    generate_and_tokenize_prompt, 
-                    batch_size=1, 
-                    device='cuda' if torch.cuda.is_available() else 'cpu'
-                )
-                print(f"Round {epoch + 1} validation loss: {eval_loss}")
-                
-                del eval_model
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"Evaluation error: {e}")
+                # Save config in the round directory
+                global_config.save_pretrained(round_dir)
+                print(f"Saved global config with rank {effective_global_rank} to {round_dir}")
 
-    print(f"Training completed. Models saved to {model_output_dir}")
+        else: # Not using federation
+            print(f"\nNo federation: Client models saved individually in round {epoch} directories.")
+
+        # --- Optional: Evaluate Global Model (only if federating and val data exists) ---
+        if use_federation and val_data_path and global_params is not None: # Check global_params exists
+            if int(os.environ.get("LOCAL_RANK", 0)) == 0: # Evaluate only on rank 0
+                print("\nEvaluating aggregated global model on validation data...")
+                try:
+                    # Load the base model for evaluation
+                    eval_bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+                    eval_base_model = AutoModelForCausalLM.from_pretrained(
+                        base_model,
+                        quantization_config=eval_bnb_config,
+                        torch_dtype=torch.float16,
+                        device_map="auto", # Use available device for evaluation
+                    )
+                    eval_base_model = prepare_model_for_kbit_training(eval_base_model)
+
+                    # Create PEFT model with the global config
+                    # Load config from the saved directory for this round
+                    eval_config = LoraConfig.from_pretrained(os.path.join(model_output_dir, str(epoch)))
+                    eval_model = get_peft_model(eval_base_model, eval_config)
+
+                    # Load the aggregated global parameters
+                    set_peft_model_state_dict(eval_model, global_params, "default")
+                    eval_model.eval() # Set to evaluation mode
+
+                    eval_loss = evaluate_global_model(
+                        eval_model,
+                        val_data_path,
+                        generate_and_tokenize_prompt,
+                        batch_size=local_micro_batch_size, # Use micro batch size for eval
+                        device=eval_model.device # Use the model's device
+                    )
+                    print(f"Round {epoch + 1} validation loss: {eval_loss}")
+                    wandb.log({"val_loss": eval_loss, "communication_round": epoch})
+
+                    # Cleanup evaluation model
+                    del eval_model
+                    del eval_base_model
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                except Exception as e:
+                    print(f"Evaluation error during round {epoch + 1}: {e}")
+                    # Cleanup in case of error during evaluation
+                    if 'eval_model' in locals(): del eval_model
+                    if 'eval_base_model' in locals(): del eval_base_model
+                    gc.collect()
+                    if torch.cuda.is_available(): torch.cuda.empty_cache()
+            else:
+                # If not rank 0 in DDP, wait for rank 0 to finish evaluation potentially
+                if ddp: torch.distributed.barrier()
+
+
+    print(f"\nTraining completed. Models saved to {model_output_dir}")
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        wandb.finish() # Finish wandb run
 
 
 if __name__ == "__main__":

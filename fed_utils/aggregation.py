@@ -3,7 +3,7 @@ Model aggregation methods for federated learning.
 Contains implementations of FedAvg and HetLoRA aggregation methods.
 """
 
-from typing import Dict, Set, Any
+from typing import Dict, Set, Any, Tuple
 import torch
 import os
 from torch.nn.functional import normalize
@@ -125,7 +125,7 @@ def hetlora(
     local_dataset_lens: Dict[int, int],
     epoch: int,
     client_lora_ranks: Dict[int, int]
-) -> Dict:
+) -> Tuple[Dict, Dict[int, float], Dict[int, float]]: # <-- Updated return type hint
     """
     Heterogeneous LoRA aggregation using Sparsity-Weighted Aggregation.
     Follows the HetLoRA algorithm from the paper.
@@ -139,7 +139,10 @@ def hetlora(
         client_lora_ranks: Dictionary mapping client IDs to their LoRA ranks
 
     Returns:
-        Updated global PEFT parameters with maximum rank
+        A tuple containing:
+            - Updated global PEFT parameters with maximum rank
+            - Dictionary mapping client IDs to their sparsity scores
+            - Dictionary mapping client IDs to their aggregation weights # <-- Added description
     """
     # Determine the maximum rank among all clients (not just selected ones)
     max_rank = max(client_lora_ranks.values())
@@ -203,15 +206,22 @@ def hetlora(
         # Calculate the Frobenius norm as the sparsity score
         client_sparsity_scores[client_id] = total_norm_squared ** 0.5
         print(f"  Client {client_id} (rank {client_rank}): Sparsity score = {client_sparsity_scores[client_id]:.6f}")
-    
+
     # Calculate aggregation weights based on sparsity scores
     Z = sum(client_sparsity_scores.values())
-    client_weights_array = {cid: client_sparsity_scores[cid] / Z for cid in selected_clients}
-    
+    # Handle potential division by zero if all scores are zero
+    if Z == 0:
+        # Assign equal weights if Z is zero (e.g., first round or all scores zero)
+        num_selected = len(selected_clients)
+        client_weights_array = {cid: 1.0 / num_selected for cid in selected_clients}
+        print(f"HetLoRA: Warning - Sum of sparsity scores is zero. Assigning equal weights.")
+    else:
+        client_weights_array = {cid: client_sparsity_scores[cid] / Z for cid in selected_clients}
+
     print(f"HetLoRA: Aggregation weights based on sparsity scores:")
     for client_id in selected_clients:
         print(f"  Client {client_id}: Weight = {client_weights_array[client_id]:.6f}")
-    
+
     # Check if we have global_params already, otherwise initialize
     if not global_params:
         print(f"HetLoRA: Initializing global parameters structure")
@@ -303,4 +313,5 @@ def hetlora(
                     aggregated_params[key] += param * weight
     
     print(f"HetLoRA: Aggregation complete")
-    return aggregated_params
+    # Return the aggregation weights along with other results
+    return aggregated_params, client_sparsity_scores, client_weights_array # <-- Updated return statement

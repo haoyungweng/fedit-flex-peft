@@ -14,9 +14,9 @@ class Prompter:
     
     # Default Alpaca template for simplicity
     DEFAULT_TEMPLATE = {
-        "description": "Template used by Alpaca-LoRA.",
-        "prompt_input": "Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n",
-        "prompt_no_input": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{instruction}\n\n### Response:\n",
+        "description": "A shorter template to experiment with.",
+        "prompt_input": "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n",
+        "prompt_no_input": "### Instruction:\n{instruction}\n\n### Response:\n",
         "response_split": "### Response:"
     }
     
@@ -62,6 +62,7 @@ class Prompter:
         """
         if input_text:
             # Use the template with input
+            print('error!')
             prompt = self.template["prompt_input"].format(
                 instruction=instruction, input=input_text
             )

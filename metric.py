@@ -355,7 +355,10 @@ def main(
     """
     # Construct the prediction file path
     if client_id is None:
-        prediction_filename = "global_output.jsonl"
+        if hetlora:
+            prediction_filename = "hetlora_combined_output.jsonl"
+        else:
+            prediction_filename = "global_output.jsonl"
     else:
         # Check if hetlora flag is set for client-specific evaluation
         if hetlora:

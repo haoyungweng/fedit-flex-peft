@@ -37,7 +37,7 @@ class FederatedClient:
         self.local_data = load_dataset("json", data_files=self.local_data_path)
         self.output_dir = output_dir
         # Use a temporary directory for trainer checkpoints
-        self.trainer_checkpoint_dir = os.path.join(self.output_dir, "_trainer_temp", f"client_{self.client_id}")
+        # self.trainer_checkpoint_dir = os.path.join(self.output_dir, "_trainer_temp", f"client_{self.client_id}")
         
         # Will be set later
         self.local_train_dataset = None
@@ -104,7 +104,7 @@ class FederatedClient:
             eval_strategy="steps" if self.local_val_set_size > 0 else "no",
             save_strategy="no",
             eval_steps=200 if self.local_val_set_size > 0 else None,
-            output_dir=self.trainer_checkpoint_dir,
+            # output_dir=self.trainer_checkpoint_dir,
             save_total_limit=1,  # Keep this just in case internal checkpoints are created
             load_best_model_at_end=self.local_val_set_size > 0,  # Load best model if doing evaluation
             ddp_find_unused_parameters=False if use_ddp else None,
