@@ -3,15 +3,12 @@ Model aggregation methods for federated learning.
 Contains implementations of FedAvg and HetLoRA aggregation methods.
 """
 
-from typing import Dict, Set, Any, Tuple
+from typing import Dict, Set, Tuple
 import torch
 import os
 from torch.nn.functional import normalize
 from peft import (
-    set_peft_model_state_dict,
-    get_peft_model,
     LoraConfig,
-    PeftModel
 )
 
 
@@ -24,40 +21,54 @@ def fedavg(
 ) -> Dict:
     """
     Standard Federated Averaging for LoRA adapters with same rank.
-    
+
     Args:
-        global_params: Global PEFT parameters to update
-        selected_clients: Set of client IDs selected for aggregation
-        output_dir: Directory containing client model weights
-        local_dataset_lens: Dictionary mapping client IDs to their dataset sizes
-        epoch: Current communication round
-        
+        global_params: Global PEFT parameters to update (can be None initially).
+        selected_clients: Set of client IDs selected for aggregation.
+        output_dir: Directory containing client model weights for the current epoch.
+        local_dataset_lens: Dictionary mapping client IDs to their dataset sizes.
+        epoch: Current communication round number.
+
     Returns:
-        Updated global PEFT parameters
+        Updated global PEFT parameters.
     """
+    if not selected_clients:
+        print("FedAvg: No clients selected. Returning existing global_params.")
+        return global_params
+
+    selected_clients_list = list(selected_clients)
+
     # Normalize weights based on dataset sizes
     weights_array = normalize(
-        torch.tensor([local_dataset_lens[client_id] for client_id in selected_clients],
+        torch.tensor([local_dataset_lens.get(client_id, 0) for client_id in selected_clients_list],
                      dtype=torch.float32),
         p=1, dim=0)
-    
+
+    aggregated_params = None
+
     # Weighted aggregation of client models
-    for k, client_id in enumerate(selected_clients):
+    for k, client_id in enumerate(selected_clients_list):
         model_path = os.path.join(output_dir, str(epoch), f"client_{client_id}", "adapter_model.bin")
-        client_weights = torch.load(model_path, map_location="cpu")
-        
-        if k == 0:
-            # Initialize weighted sum with first client's weights
-            weighted_sum = {key: client_weights[key] * weights_array[k] for key in client_weights.keys()}
+        try:
+            client_weights = torch.load(model_path, map_location="cpu")
+        except FileNotFoundError:
+            print(f"FedAvg Warning: Model file not found for client {client_id} at {model_path}. Skipping.")
+            continue
+
+        weight = weights_array[k]
+
+        if aggregated_params is None:
+            # Initialize aggregated_params structure and values from the first valid client
+            aggregated_params = {key: param.clone() * weight for key, param in client_weights.items()}
         else:
-            # Add weighted client weights to aggregated weights
-            weighted_sum = {
-                key: weighted_sum[key] + client_weights[key] * weights_array[k] 
-                for key in client_weights.keys()
-            }
-    
-    # Return the updated global parameters
-    return weighted_sum
+            # Add weighted client weights to the aggregation
+            for key in aggregated_params.keys():
+                if key in client_weights:
+                    aggregated_params[key] += client_weights[key] * weight
+                else:
+                    print(f"FedAvg Warning: Key '{key}' not found in client {client_id}'s weights. Skipping key.")
+
+    return aggregated_params if aggregated_params is not None else global_params
 
 
 def load_hetlora_weights(
@@ -66,55 +77,52 @@ def load_hetlora_weights(
     client_rank: int
 ) -> Dict:
     """
-    Extract weights from global parameters for a client with specific rank.
-    Implements the truncation distribution method described in the HetLoRA paper.
+    Extract weights from global parameters for a client with specific rank using truncation.
 
     Args:
-        client_config: LoRA configuration for the client
-        global_params: Global PEFT parameters
-        client_rank: LoRA rank for the client model
+        client_config: LoRA configuration for the client (used to get target modules).
+        global_params: Global PEFT parameters state dict.
+        client_rank: LoRA rank for the client model.
 
     Returns:
-        Truncated weights for the client model
+        Truncated weights state dict for the client model.
     """
     client_weights = {}
-    
-    # Get global rank from the parameters
-    if any("lora_A." in key for key in global_params.keys()):
-        global_rank = max(param.shape[0] for key, param in global_params.items() 
-                         if "lora_A." in key)
-        print(f"load_hetlora: Global rank = {global_rank}, Client rank = {client_rank}")
-    else:
-        print(f"load_hetlora: No global parameters with LoRA structure found")
-        return client_weights
-    
-    # Group parameters by module for more efficient processing
-    module_names = set()
-    for key in global_params.keys():
+    global_rank = 0
+
+    # Determine global rank from the provided global_params state dict
+    for key, param in global_params.items():
         if "lora_A." in key:
-            module_name = key.split('.lora_A.')[0]
-            module_names.add(module_name)
-    
-    # Process each module's A and B matrices together
-    for module_name in module_names:
-        a_key = f"{module_name}.lora_A.weight"
-        b_key = f"{module_name}.lora_B.weight"
-        
-        if a_key in global_params and b_key in global_params:
-            # For lora_A matrices: [rank, in_features]
-            if client_rank <= global_rank:
-                client_weights[a_key] = global_params[a_key][:client_rank, :].clone()
-            
-            # For lora_B matrices: [out_features, rank]
-            if client_rank <= global_rank:
-                client_weights[b_key] = global_params[b_key][:, :client_rank].clone()
-    
-    # Process other parameters
+            global_rank = max(global_rank, param.shape[0])
+        elif "lora_B." in key:
+            global_rank = max(global_rank, param.shape[1])
+
+    if global_rank == 0:
+        print(f"load_hetlora: No LoRA parameters found in global_params. Returning empty dict.")
+        return client_weights
+
+    print(f"load_hetlora: Global rank = {global_rank}, Client target rank = {client_rank}")
+
+    if client_rank > global_rank:
+        print(f"load_hetlora: Warning - Client rank {client_rank} > Global rank {global_rank}. Cannot truncate.")
+        return global_params.copy() # Return full global params if client rank is larger
+
+    # Process parameters based on target modules in client_config
     for key, global_param in global_params.items():
-        if ".lora_A." not in key and ".lora_B." not in key:
+        is_lora_A = ".lora_A." in key
+        is_lora_B = ".lora_B." in key
+
+        if is_lora_A:
+            # Truncate lora_A: [global_rank, in_features] -> [client_rank, in_features]
+            client_weights[key] = global_param[:client_rank, :].clone()
+        elif is_lora_B:
+            # Truncate lora_B: [out_features, global_rank] -> [out_features, client_rank]
+            client_weights[key] = global_param[:, :client_rank].clone()
+        else:
+            # Copy non-LoRA parameters directly
             client_weights[key] = global_param.clone()
-    
-    print(f"load_hetlora: Truncation complete with {len(client_weights)} parameters")
+
+    print(f"load_hetlora: Truncation complete with {len(client_weights)} parameters for rank {client_rank}")
     return client_weights
 
 
@@ -124,194 +132,178 @@ def hetlora(
     output_dir: str,
     local_dataset_lens: Dict[int, int],
     epoch: int,
-    client_lora_ranks: Dict[int, int]
-) -> Tuple[Dict, Dict[int, float], Dict[int, float]]: # <-- Updated return type hint
+    client_lora_ranks: Dict[int, int],
+    target_global_rank: int
+) -> Tuple[Dict, Dict[int, float], Dict[int, float]]:
     """
     Heterogeneous LoRA aggregation using Sparsity-Weighted Aggregation.
-    Follows the HetLoRA algorithm from the paper.
 
     Args:
-        global_params: Global PEFT parameters to update
-        selected_clients: Set of client IDs selected for aggregation
-        output_dir: Directory containing client model weights
-        local_dataset_lens: Dictionary mapping client IDs to their dataset sizes
-        epoch: Current communication round
-        client_lora_ranks: Dictionary mapping client IDs to their LoRA ranks
+        global_params: Current global PEFT parameters state dict (can be None initially).
+        selected_clients: Set of client IDs selected for aggregation.
+        output_dir: Directory containing client model weights for the current epoch.
+        local_dataset_lens: Dictionary mapping client IDs to their dataset sizes.
+        epoch: Current communication round number.
+        client_lora_ranks: Dictionary mapping client IDs to their LoRA ranks (for all clients).
+        target_global_rank: The target rank for the aggregated global model.
 
     Returns:
         A tuple containing:
-            - Updated global PEFT parameters with maximum rank
-            - Dictionary mapping client IDs to their sparsity scores
-            - Dictionary mapping client IDs to their aggregation weights # <-- Added description
+            - Updated global PEFT parameters state dict with target_global_rank.
+            - Dictionary mapping participating client IDs to their sparsity scores.
+            - Dictionary mapping participating client IDs to their aggregation weights.
     """
-    # Determine the maximum rank among all clients (not just selected ones)
-    max_rank = max(client_lora_ranks.values())
-    print(f"HetLoRA: Maximum rank among all clients: {max_rank}")
-    
-    # Calculate sparsity scores for each client based on ||B_k @ A_k||_F
+    if not selected_clients:
+        print("HetLoRA: No clients selected. Returning existing global_params.")
+        return global_params, {}, {}
+
+    selected_clients_list = list(selected_clients)
+    print(f"HetLoRA: Aggregating {len(selected_clients_list)} clients. Target global rank: {target_global_rank}")
+
     client_sparsity_scores = {}
-    client_weights = {}
-    
+    client_loaded_weights = {}
+
     print(f"HetLoRA: Loading client weights and calculating sparsity scores...")
-    
-    # Load client weights and calculate sparsity scores
-    for client_id in selected_clients:
-        client_rank = client_lora_ranks[client_id]
+    for client_id in selected_clients_list:
+        client_rank = client_lora_ranks.get(client_id, 0)
         model_path = os.path.join(output_dir, str(epoch), f"client_{client_id}", "adapter_model.bin")
-        client_state_dict = torch.load(model_path, map_location="cpu")
-        client_weights[client_id] = client_state_dict
-        
-        # Optimized Frobenius norm calculation using trace trick
+
+        try:
+            client_state_dict = torch.load(model_path, map_location="cpu")
+            client_loaded_weights[client_id] = client_state_dict
+        except FileNotFoundError:
+            print(f"HetLoRA Warning: Model file not found for client {client_id} at {model_path}. Skipping.")
+            client_sparsity_scores[client_id] = 0.0
+            continue
+
+        if client_rank == 0:
+            client_sparsity_scores[client_id] = 0.0
+            continue
+
+        # Calculate sparsity score ||B_k @ A_k||_F
         total_norm_squared = 0.0
-        processed_modules = set()
-        
-        # Group parameters by module for more efficient processing
         module_to_keys = {}
         for key in client_state_dict.keys():
             if ".lora_A." in key:
                 module_name = key.split('.lora_A.')[0]
-                if module_name not in module_to_keys:
-                    module_to_keys[module_name] = {"A": None, "B": None}
+                if module_name not in module_to_keys: module_to_keys[module_name] = {"A": None, "B": None}
                 module_to_keys[module_name]["A"] = key
             elif ".lora_B." in key:
                 module_name = key.split('.lora_B.')[0]
-                if module_name not in module_to_keys:
-                    module_to_keys[module_name] = {"A": None, "B": None}
+                if module_name not in module_to_keys: module_to_keys[module_name] = {"A": None, "B": None}
                 module_to_keys[module_name]["B"] = key
-        
-        # Process each module more efficiently
+
         for module_name, keys in module_to_keys.items():
             if keys["A"] is not None and keys["B"] is not None:
-                lora_A = client_state_dict[keys["A"]]  # [r, in_dim]
-                lora_B = client_state_dict[keys["B"]]  # [out_dim, r]
-                
-                # Verify shapes match the expected client rank
+                lora_A = client_state_dict[keys["A"]].float()
+                lora_B = client_state_dict[keys["B"]].float()
+
                 if lora_A.shape[0] == client_rank and lora_B.shape[1] == client_rank:
-                    # Optimized computation of ||B × A||_F^2 using trace trick
-                    # ||BA||_F^2 = Tr((BA)^T(BA)) = Tr(A^TB^TBA)
-                    # This avoids materializing the full delta_W matrix
-                    
-                    # Method 1: Using matrix trace trick (more memory efficient)
-                    BTB = torch.matmul(lora_B.T, lora_B)  # [r, r]
-                    BTB_A = torch.matmul(BTB, lora_A)  # [r, in_dim]
+                    BTB = torch.matmul(lora_B.T, lora_B)
+                    BTB_A = torch.matmul(BTB, lora_A)
                     module_norm_squared = torch.sum(lora_A * BTB_A).item()
-                    
-                    # Alternative method (less memory efficient but sometimes faster):
-                    # delta_W = torch.matmul(lora_B, lora_A)  # [out_dim, in_dim]
-                    # module_norm_squared = torch.sum(delta_W**2).item()
-                    
                     total_norm_squared += module_norm_squared
-                    processed_modules.add(module_name)
-        
-        # Calculate the Frobenius norm as the sparsity score
+                else:
+                    print(f"  HetLoRA Warning: Mismatched shapes for client {client_id}, module {module_name}.")
+
         client_sparsity_scores[client_id] = total_norm_squared ** 0.5
         print(f"  Client {client_id} (rank {client_rank}): Sparsity score = {client_sparsity_scores[client_id]:.6f}")
 
-    # Calculate aggregation weights based on sparsity scores
-    Z = sum(client_sparsity_scores.values())
-    # Handle potential division by zero if all scores are zero
+    # Calculate aggregation weights
+    valid_scores = [score for cid, score in client_sparsity_scores.items() if cid in client_loaded_weights]
+    Z = sum(valid_scores)
     if Z == 0:
-        # Assign equal weights if Z is zero (e.g., first round or all scores zero)
-        num_selected = len(selected_clients)
-        client_weights_array = {cid: 1.0 / num_selected for cid in selected_clients}
+        num_valid_clients = len(valid_scores)
+        client_aggregation_weights = {cid: 1.0 / num_valid_clients for cid in client_loaded_weights} if num_valid_clients > 0 else {}
         print(f"HetLoRA: Warning - Sum of sparsity scores is zero. Assigning equal weights.")
     else:
-        client_weights_array = {cid: client_sparsity_scores[cid] / Z for cid in selected_clients}
+        client_aggregation_weights = {cid: client_sparsity_scores.get(cid, 0.0) / Z for cid in client_loaded_weights}
 
-    print(f"HetLoRA: Aggregation weights based on sparsity scores:")
-    for client_id in selected_clients:
-        print(f"  Client {client_id}: Weight = {client_weights_array[client_id]:.6f}")
+    print(f"HetLoRA: Aggregation weights:")
+    for client_id in client_loaded_weights:
+        print(f"  Client {client_id}: Weight = {client_aggregation_weights.get(client_id, 0.0):.6f}")
 
-    # Check if we have global_params already, otherwise initialize
-    if not global_params:
-        print(f"HetLoRA: Initializing global parameters structure")
-        # Use the first client to determine structure
-        first_client_id = next(iter(selected_clients))
-        first_client_state = client_weights[first_client_id]
-        
-        # Initialize structure with zeros of appropriate shape
-        global_params = {}
-        for key, param in first_client_state.items():
-            if "lora_A." in key:
-                # For A matrices: [max_rank, in_dim]
-                in_dim = param.shape[1]
-                global_params[key] = torch.zeros((max_rank, in_dim), device="cpu")
-            elif "lora_B." in key:
-                # For B matrices: [out_dim, max_rank]
-                out_dim = param.shape[0]
-                global_params[key] = torch.zeros((out_dim, max_rank), device="cpu")
-            else:
-                # For other parameters, copy directly
-                global_params[key] = torch.zeros_like(param, device="cpu")
-    
-    # Ensure global params have right shape for current max_rank
-    if any("lora_A." in key for key in global_params.keys()):
-        current_rank = max(param.shape[0] for key, param in global_params.items() 
-                          if "lora_A." in key)
-        
-        print(f"HetLoRA: Current global rank: {current_rank}, Target max rank: {max_rank}")
-        
-        if current_rank != max_rank:
-            print(f"HetLoRA: Resizing global parameters from rank {current_rank} to {max_rank}")
-            # Resize global parameters to new max_rank
-            new_global_params = {}
-            for key, param in global_params.items():
-                if "lora_A." in key:
-                    # For A matrices: [current_rank, in_dim] -> [max_rank, in_dim]
-                    in_dim = param.shape[1]
-                    new_param = torch.zeros((max_rank, in_dim), device="cpu")
-                    # Copy existing weights
-                    min_rank = min(current_rank, max_rank)
-                    new_param[:min_rank, :] = param[:min_rank, :]
-                    new_global_params[key] = new_param
-                elif "lora_B." in key:
-                    # For B matrices: [out_dim, current_rank] -> [out_dim, max_rank]
-                    out_dim = param.shape[0]
-                    new_param = torch.zeros((out_dim, max_rank), device="cpu")
-                    # Copy existing weights
-                    min_rank = min(current_rank, max_rank)
-                    new_param[:, :min_rank] = param[:, :min_rank]
-                    new_global_params[key] = new_param
-                else:
-                    new_global_params[key] = param.clone()
-            
-            global_params = new_global_params
-    
-    # Initialize aggregated weights with zeros
+    # Initialize or resize aggregated_params structure
     aggregated_params = {}
-    for key, param in global_params.items():
-        aggregated_params[key] = torch.zeros_like(param, device="cpu")
-    
+    current_global_rank = 0
+    if global_params:
+        # Determine current rank from existing global_params
+        for key, param in global_params.items():
+            if ".lora_A." in key: current_global_rank = max(current_global_rank, param.shape[0])
+            elif ".lora_B." in key: current_global_rank = max(current_global_rank, param.shape[1])
+        print(f"HetLoRA: Current global rank: {current_global_rank}, Target global rank: {target_global_rank}")
+
+        # Initialize based on existing structure, resizing if necessary
+        for key, param in global_params.items():
+            if ".lora_A." in key:
+                in_dim = param.shape[1]
+                new_param = torch.zeros((target_global_rank, in_dim), device="cpu")
+                copy_rank = min(current_global_rank, target_global_rank)
+                if copy_rank > 0: new_param[:copy_rank, :] = param[:copy_rank, :].to("cpu")
+                aggregated_params[key] = new_param
+            elif ".lora_B." in key:
+                out_dim = param.shape[0]
+                new_param = torch.zeros((out_dim, target_global_rank), device="cpu")
+                copy_rank = min(current_global_rank, target_global_rank)
+                if copy_rank > 0: new_param[:, :copy_rank] = param[:, :copy_rank].to("cpu")
+                aggregated_params[key] = new_param
+            else:
+                aggregated_params[key] = torch.zeros_like(param, device="cpu")
+    else:
+        # Initialize structure from the first valid client if global_params is None
+        print(f"HetLoRA: Initializing global parameters structure with target rank {target_global_rank}")
+        first_valid_client_id = next((cid for cid in selected_clients_list if cid in client_loaded_weights), None)
+        if first_valid_client_id is None:
+            print("HetLoRA Error: Cannot initialize global params, no valid client models found.")
+            return {}, {}, {}
+
+        first_client_state = client_loaded_weights[first_valid_client_id]
+        for key, param in first_client_state.items():
+            if ".lora_A." in key:
+                in_dim = param.shape[1]
+                aggregated_params[key] = torch.zeros((target_global_rank, in_dim), device="cpu")
+            elif ".lora_B." in key:
+                out_dim = param.shape[0]
+                aggregated_params[key] = torch.zeros((out_dim, target_global_rank), device="cpu")
+            else:
+                aggregated_params[key] = torch.zeros_like(param, device="cpu")
+
+    # Aggregate client weights with zero-padding
     print(f"HetLoRA: Aggregating client weights with zero-padding...")
-    # Aggregate client weights with sparsity-based weighting
-    for client_id in selected_clients:
-        client_rank = client_lora_ranks[client_id]
-        client_state_dict = client_weights[client_id]
-        weight = client_weights_array[client_id]
-        
-        # Group parameters by module for more efficient processing
-        module_names = set()
-        for key in client_state_dict.keys():
-            if "lora_A." in key:
-                module_name = key.split('.lora_A.')[0]
-                module_names.add(module_name)
-        
-        # Process each module's parameters together
-        for module_name in module_names:
-            a_key = f"{module_name}.lora_A.weight"
-            b_key = f"{module_name}.lora_B.weight"
-            
-            if a_key in client_state_dict and b_key in client_state_dict and a_key in aggregated_params and b_key in aggregated_params:
-                # Zero-padding: place client weights in first client_rank rows/columns
-                aggregated_params[a_key][:client_rank, :] += client_state_dict[a_key] * weight
-                aggregated_params[b_key][:, :client_rank] += client_state_dict[b_key] * weight
-        
-        # Process other parameters
-        for key, param in client_state_dict.items():
-            if ".lora_A." not in key and ".lora_B." not in key:
-                if key in aggregated_params and aggregated_params[key].shape == param.shape:
-                    aggregated_params[key] += param * weight
-    
+    for client_id in client_loaded_weights:
+        client_rank = client_lora_ranks.get(client_id, 0)
+        if client_rank == 0: continue
+
+        client_state_dict = client_loaded_weights[client_id]
+        weight = client_aggregation_weights.get(client_id, 0.0)
+        if weight == 0.0: continue
+
+        for key, client_param in client_state_dict.items():
+            if key not in aggregated_params:
+                continue
+
+            client_param_cpu = client_param.to("cpu")
+
+            if ".lora_A." in key:
+                # Add client's A weights to the top-left corner
+                if client_rank <= target_global_rank:
+                     aggregated_params[key][:client_rank, :] += client_param_cpu * weight
+                else: # Should not happen if target_global_rank is max rank
+                     aggregated_params[key][:, :] += client_param_cpu[:target_global_rank, :] * weight
+            elif ".lora_B." in key:
+                # Add client's B weights to the top-left corner
+                if client_rank <= target_global_rank:
+                     aggregated_params[key][:, :client_rank] += client_param_cpu * weight
+                else:
+                     aggregated_params[key][:, :] += client_param_cpu[:, :target_global_rank] * weight
+            else:
+                # Aggregate non-LoRA parameters
+                if aggregated_params[key].shape == client_param_cpu.shape:
+                    aggregated_params[key] += client_param_cpu * weight
+                else:
+                     print(f"  HetLoRA Warning: Shape mismatch for non-LoRA key '{key}'. Skipping.")
+
     print(f"HetLoRA: Aggregation complete")
-    # Return the aggregation weights along with other results
-    return aggregated_params, client_sparsity_scores, client_weights_array # <-- Updated return statement
+    final_scores = {cid: score for cid, score in client_sparsity_scores.items() if cid in client_loaded_weights}
+    final_weights = {cid: weight for cid, weight in client_aggregation_weights.items() if cid in client_loaded_weights}
+    return aggregated_params, final_scores, final_weights

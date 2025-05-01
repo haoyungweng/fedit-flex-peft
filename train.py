@@ -219,7 +219,7 @@ def fl_finetune(
     if use_hetero:
         # Assign potentially heterogeneous ranks (hardcoded example)
         if num_clients == 8:
-            final_rank_assignments = [6, 8, 4, 4, 6, 8, 6, 6]
+            final_rank_assignments = [4, 6, 4, 6, 6, 6, 6, 6]
         else:
             # Fallback: assign base rank if not 8 clients (or implement other logic)
             print(f"Warning: Using base rank {lora_r} for all clients as num_clients is not 8 and use_hetero=True.")

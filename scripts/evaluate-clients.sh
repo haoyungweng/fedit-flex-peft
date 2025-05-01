@@ -7,7 +7,7 @@ do
     echo "Running evaluation for client_id=${client_id}..."
 
     python metric.py \
-        --exp_name 'hetero-3B-optimalr' \
+        --exp_name 'hetero-1B' \
         --target_file './data/dataset1/flan_test_200_selected_nstrict_1.jsonl' \
         --target_key 'output' \
         --prediction_dir './predictions' \

@@ -10,8 +10,8 @@ do
   echo "Running generation for client_id=${client_id}..."
 
   CUDA_VISIBLE_DEVICES="${cuda_devices}" python generate.py \
-      --exp_name 'hetero-3B-optimalr' \
-      --base_model 'meta-llama/Llama-3.2-3B' \
+      --exp_name 'hetero-1B' \
+      --base_model 'meta-llama/Llama-3.2-1B' \
       --model_dir '/home/scratch/haoyungw/genai/' \
       --communication_rounds 20 \
       --test_file_path './data/dataset1/flan_test_200_selected_nstrict_1.jsonl' \
